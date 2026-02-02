@@ -1,0 +1,40 @@
+[
+  {
+    "id": "seq-001",
+    "category": "minigame",
+    "difficulty": "easy",
+    "type": "sequence",
+    "config": {
+      "instruction": "숫자를 순서대로 정렬하세요",
+      "items": ["3", "1", "4", "2"],
+      "correctOrder": [1, 3, 0, 2]
+    }
+  },
+  {
+    "id": "memory-001",
+    "category": "minigame",
+    "difficulty": "medium",
+    "type": "memory",
+    "config": {
+      "pairs": [
+        { "id": 1, "front": "apple", "back": "사과" },
+        { "id": 2, "front": "banana", "back": "바나나" },
+        { "id": 3, "front": "orange", "back": "오렌지" },
+        { "id": 4, "front": "grape", "back": "포도" }
+      ],
+      "matchType": "text-text"
+    }
+  },
+  {
+    "id": "connect-001",
+    "category": "minigame",
+    "difficulty": "easy",
+    "type": "connect",
+    "config": {
+      "instruction": "동물과 울음소리를 연결하세요",
+      "leftItems": ["강아지", "고양이", "소", "닭"],
+      "rightItems": ["야옹", "멍멍", "꼬끼오", "음메"],
+      "correctPairs": [[0, 1], [1, 0], [2, 3], [3, 2]]
+    }
+  }
+]

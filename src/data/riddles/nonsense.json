@@ -1,0 +1,52 @@
+[
+  {
+    "id": "nonsense-001",
+    "category": "nonsense",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "세상에서 가장 빠른 닭은?",
+      "answer": "후딱"
+    }
+  },
+  {
+    "id": "nonsense-002",
+    "category": "nonsense",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "아몬드가 죽으면?",
+      "answer": "다이아몬드"
+    }
+  },
+  {
+    "id": "nonsense-003",
+    "category": "nonsense",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "반성문을 영어로 하면?",
+      "answer": "글로벌"
+    }
+  },
+  {
+    "id": "nonsense-004",
+    "category": "nonsense",
+    "difficulty": "medium",
+    "type": "text",
+    "config": {
+      "question": "세상에서 가장 뜨거운 과일은?",
+      "answer": "천도복숭아"
+    }
+  },
+  {
+    "id": "nonsense-005",
+    "category": "nonsense",
+    "difficulty": "medium",
+    "type": "text",
+    "config": {
+      "question": "가장 맛있는 집은?",
+      "answer": "초가집"
+    }
+  }
+]

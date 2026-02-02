@@ -1,0 +1,55 @@
+[
+  {
+    "id": "english-001",
+    "category": "english",
+    "difficulty": "easy",
+    "type": "choice",
+    "config": {
+      "question": "'사과'를 영어로?",
+      "options": ["Banana", "Apple", "Orange", "Grape"],
+      "answerIndex": 1
+    }
+  },
+  {
+    "id": "english-002",
+    "category": "english",
+    "difficulty": "easy",
+    "type": "choice",
+    "config": {
+      "question": "'고양이'를 영어로?",
+      "options": ["Dog", "Bird", "Cat", "Fish"],
+      "answerIndex": 2
+    }
+  },
+  {
+    "id": "english-003",
+    "category": "english",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "'책'을 영어로 쓰면?",
+      "answer": "book"
+    }
+  },
+  {
+    "id": "english-004",
+    "category": "english",
+    "difficulty": "medium",
+    "type": "choice",
+    "config": {
+      "question": "'무지개'를 영어로?",
+      "options": ["Sunshine", "Rainbow", "Cloud", "Thunder"],
+      "answerIndex": 1
+    }
+  },
+  {
+    "id": "english-005",
+    "category": "english",
+    "difficulty": "medium",
+    "type": "text",
+    "config": {
+      "question": "'친구'를 영어로 쓰면?",
+      "answer": "friend"
+    }
+  }
+]

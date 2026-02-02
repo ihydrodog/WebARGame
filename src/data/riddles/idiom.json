@@ -1,0 +1,44 @@
+[
+  {
+    "id": "idiom-001",
+    "category": "idiom",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "◯심◯력 - 마음과 힘을 하나로 합침",
+      "answer": "일심단력"
+    }
+  },
+  {
+    "id": "idiom-002",
+    "category": "idiom",
+    "difficulty": "medium",
+    "type": "choice",
+    "config": {
+      "question": "'매우 기쁘고 신남'을 뜻하는 사자성어는?",
+      "options": ["희희낙락", "전전긍긍", "좌불안석", "노심초사"],
+      "answerIndex": 0
+    }
+  },
+  {
+    "id": "idiom-003",
+    "category": "idiom",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "◯기◯투 - 한 번 겨룸으로 두 마리의 토끼를 잡는다",
+      "answer": "일거양득"
+    }
+  },
+  {
+    "id": "idiom-004",
+    "category": "idiom",
+    "difficulty": "medium",
+    "type": "choice",
+    "config": {
+      "question": "'힘을 합쳐 어려움을 극복함'을 뜻하는 사자성어는?",
+      "options": ["동고동락", "동병상련", "동분서주", "협동정신"],
+      "answerIndex": 0
+    }
+  }
+]

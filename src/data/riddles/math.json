@@ -1,0 +1,52 @@
+[
+  {
+    "id": "math-001",
+    "category": "math",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "7 + 8 = ?",
+      "answer": "15"
+    }
+  },
+  {
+    "id": "math-002",
+    "category": "math",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "12 - 5 = ?",
+      "answer": "7"
+    }
+  },
+  {
+    "id": "math-003",
+    "category": "math",
+    "difficulty": "easy",
+    "type": "text",
+    "config": {
+      "question": "3 x 4 = ?",
+      "answer": "12"
+    }
+  },
+  {
+    "id": "math-004",
+    "category": "math",
+    "difficulty": "medium",
+    "type": "text",
+    "config": {
+      "question": "25 + 17 = ?",
+      "answer": "42"
+    }
+  },
+  {
+    "id": "math-005",
+    "category": "math",
+    "difficulty": "medium",
+    "type": "text",
+    "config": {
+      "question": "56 ÷ 8 = ?",
+      "answer": "7"
+    }
+  }
+]
