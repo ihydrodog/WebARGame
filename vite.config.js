@@ -1,6 +1,9 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  // GitHub Pages base path (repository name)
+  base: '/WebARGame/',
+  
   // Enable JSON imports
   json: {
     stringify: false
