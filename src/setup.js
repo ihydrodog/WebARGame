@@ -353,6 +353,7 @@ function setupEditorEvents(treasure, isNew) {
   let detectedObjects = [];
   let selectedObject = treasure.detectedObject || null;
   let selectedRiddleId = treasure.riddleId || null;
+  let isMirroredCamera = false; // Track if camera is mirrored (front-facing)
   
   // Back button
   document.getElementById('btn-back').addEventListener('click', () => {
@@ -382,6 +383,13 @@ function setupEditorEvents(treasure, isNew) {
         video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } 
       });
       video.srcObject = webcamStream;
+      
+      // Detect if camera is mirrored (front-facing or desktop webcam)
+      const track = webcamStream.getVideoTracks()[0];
+      const settings = track.getSettings();
+      // Front camera ('user') or desktop webcam (no facingMode) are typically mirrored
+      isMirroredCamera = settings.facingMode === 'user' || !settings.facingMode;
+      console.log('Camera settings:', settings, 'isMirrored:', isMirroredCamera);
       btnStartWebcam.style.display = 'none';
       btnCapture.style.display = 'inline-flex';
       
@@ -436,10 +444,27 @@ function setupEditorEvents(treasure, isNew) {
         else imageElement.onload = resolve;
       });
       
+      // Debug: Log the input image to model
+      console.log('Model input image:', {
+        element: imageElement.tagName,
+        src: imageElement.src.substring(0, 100) + '...',
+        naturalSize: `${imageElement.naturalWidth}x${imageElement.naturalHeight}`,
+        displayedSize: `${imageElement.clientWidth}x${imageElement.clientHeight}`
+      });
+      
+      // Debug: Draw the model input image to a debug canvas
+      const debugCanvas = document.createElement('canvas');
+      debugCanvas.width = imageElement.naturalWidth;
+      debugCanvas.height = imageElement.naturalHeight;
+      debugCanvas.getContext('2d').drawImage(imageElement, 0, 0);
+      console.log('Model input image (open in new tab):', debugCanvas.toDataURL('image/jpeg', 0.5));
+      
       const predictions = await model.detect(imageElement);
       hideLoadingOverlay();
       
-      detectedObjects = predictions.filter(p => p.score > 0.5);
+      // Show all detections for debugging (lower threshold)
+      detectedObjects = predictions.filter(p => p.score > 0.3);
+      console.log('All predictions:', predictions);
       
       if (detectedObjects.length === 0) {
         objectsList.innerHTML = '<p class="no-objects">검출된 오브젝트가 없습니다. 다시 촬영해보세요.</p>';
@@ -464,24 +489,65 @@ function setupEditorEvents(treasure, isNew) {
   function drawDetections(canvas, predictions) {
     const ctx = canvas.getContext('2d');
     
-    // Set canvas size to match the displayed image size
+    // Get image dimensions
+    const naturalWidth = capturedImage.naturalWidth;
+    const naturalHeight = capturedImage.naturalHeight;
     const displayedWidth = capturedImage.clientWidth;
     const displayedHeight = capturedImage.clientHeight;
     
+    // Debug: Check all dimensions
+    console.log('drawDetections dimensions:', {
+      natural: `${naturalWidth}x${naturalHeight}`,
+      displayed: `${displayedWidth}x${displayedHeight}`,
+      canvas_before: `${canvas.width}x${canvas.height}`,
+      capturedImage_offsetSize: `${capturedImage.offsetWidth}x${capturedImage.offsetHeight}`,
+      capturedImage_getBoundingClientRect: capturedImage.getBoundingClientRect()
+    });
+    
+    // Set canvas size to match the displayed image size
     canvas.width = displayedWidth;
     canvas.height = displayedHeight;
     
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     
     // Scale factor: displayed size / natural size
-    const scaleX = displayedWidth / capturedImage.naturalWidth;
-    const scaleY = displayedHeight / capturedImage.naturalHeight;
+    const scaleX = displayedWidth / naturalWidth;
+    const scaleY = displayedHeight / naturalHeight;
+    
+    console.log('Scale factors:', { scaleX, scaleY });
+    
+    // Debug: Draw test boxes at known positions
+    ctx.strokeStyle = 'yellow';
+    ctx.lineWidth = 2;
+    // Box at top-left (10%, 10%)
+    ctx.strokeRect(displayedWidth * 0.1, displayedHeight * 0.1, 50, 50);
+    ctx.fillStyle = 'yellow';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('10%,10%', displayedWidth * 0.1, displayedHeight * 0.1 - 5);
+    
+    // Box at bottom-right (70%, 70%)
+    ctx.strokeStyle = 'lime';
+    ctx.strokeRect(displayedWidth * 0.7, displayedHeight * 0.7, 50, 50);
+    ctx.fillStyle = 'lime';
+    ctx.fillText('70%,70%', displayedWidth * 0.7, displayedHeight * 0.7 - 5);
     
     predictions.forEach((pred, index) => {
       const [x, y, width, height] = pred.bbox;
       const isSelected = selectedObject === pred.class;
       
+      // Debug: log raw detection
+      console.log(`Detection ${index}:`, {
+        class: pred.class,
+        score: pred.score,
+        bbox: { x, y, width, height },
+        percentOfImage: { 
+          x: `${(x/naturalWidth*100).toFixed(1)}%`, 
+          y: `${(y/naturalHeight*100).toFixed(1)}%` 
+        }
+      });
+      
       // Scale bbox coordinates to match displayed image
+      // Note: No mirroring needed - capturedImage displays raw data without CSS transform
       const scaledX = x * scaleX;
       const scaledY = y * scaleY;
       const scaledWidth = width * scaleX;
