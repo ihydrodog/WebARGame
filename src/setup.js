@@ -206,6 +206,7 @@ function renderTreasureEditor(treasure) {
           
           <div class="webcam-container" id="webcam-container">
             <video id="webcam-preview" autoplay playsinline></video>
+            <canvas id="live-detection-canvas"></canvas>
             <canvas id="capture-canvas" style="display: none;"></canvas>
             <canvas id="detection-canvas" style="display: none;"></canvas>
           </div>
@@ -367,6 +368,7 @@ function setupEditorEvents(treasure, isNew) {
   const video = document.getElementById('webcam-preview');
   const canvas = document.getElementById('capture-canvas');
   const overlayCanvas = document.getElementById('overlay-canvas');
+  const liveDetectionCanvas = document.getElementById('live-detection-canvas');
   const capturedPreview = document.getElementById('captured-preview');
   const capturedImage = document.getElementById('captured-image');
   const btnStartWebcam = document.getElementById('btn-start-webcam');
@@ -376,6 +378,10 @@ function setupEditorEvents(treasure, isNew) {
   const objectsList = document.getElementById('objects-list');
   const selectedObjectInfo = document.getElementById('selected-object-info');
   const selectedObjectName = document.getElementById('selected-object-name');
+  
+  let liveDetectionRunning = false;
+  let liveDetectionModel = null;
+  let lastLivePredictions = []; // Store last live detection results
   
   btnStartWebcam.addEventListener('click', async () => {
     try {
@@ -393,27 +399,150 @@ function setupEditorEvents(treasure, isNew) {
       btnStartWebcam.style.display = 'none';
       btnCapture.style.display = 'inline-flex';
       
-      // Preload model
-      loadObjectDetectionModel();
+      // Preload model and start live detection
+      loadObjectDetectionModel().then(model => {
+        if (model) {
+          liveDetectionModel = model;
+          startLiveDetection();
+        }
+      });
     } catch (err) {
       alert('카메라 접근 권한이 필요합니다.');
       console.error('Webcam error:', err);
     }
   });
   
+  // Live detection loop
+  function startLiveDetection() {
+    liveDetectionRunning = true;
+    
+    async function detectFrame() {
+      if (!liveDetectionRunning || !liveDetectionModel || video.paused || video.ended) {
+        return;
+      }
+      
+      // Check video is ready
+      if (video.readyState < 2) {
+        requestAnimationFrame(detectFrame);
+        return;
+      }
+      
+      try {
+        const predictions = await liveDetectionModel.detect(video);
+        lastLivePredictions = predictions.filter(p => p.score > 0.5); // Save for capture
+        drawLiveDetections(predictions);
+      } catch (err) {
+        console.error('Live detection error:', err);
+      }
+      
+      // Continue loop (throttle to ~10fps for performance)
+      setTimeout(() => requestAnimationFrame(detectFrame), 100);
+    }
+    
+    detectFrame();
+  }
+  
+  function stopLiveDetection() {
+    liveDetectionRunning = false;
+    // Clear canvas
+    const ctx = liveDetectionCanvas.getContext('2d');
+    ctx.clearRect(0, 0, liveDetectionCanvas.width, liveDetectionCanvas.height);
+  }
+  
+  function drawLiveDetections(predictions) {
+    const ctx = liveDetectionCanvas.getContext('2d');
+    
+    // Get video actual dimensions
+    const videoWidth = video.videoWidth;
+    const videoHeight = video.videoHeight;
+    
+    // Get container dimensions
+    const containerWidth = video.clientWidth;
+    const containerHeight = video.clientHeight;
+    
+    // Calculate actual video display area (object-fit: contain)
+    const videoAspect = videoWidth / videoHeight;
+    const containerAspect = containerWidth / containerHeight;
+    
+    let displayWidth, displayHeight, offsetX, offsetY;
+    
+    if (containerAspect > videoAspect) {
+      // Container is wider - video fits height, has horizontal padding
+      displayHeight = containerHeight;
+      displayWidth = containerHeight * videoAspect;
+      offsetX = (containerWidth - displayWidth) / 2;
+      offsetY = 0;
+    } else {
+      // Container is taller - video fits width, has vertical padding
+      displayWidth = containerWidth;
+      displayHeight = containerWidth / videoAspect;
+      offsetX = 0;
+      offsetY = (containerHeight - displayHeight) / 2;
+    }
+    
+    // Set canvas size to match container
+    liveDetectionCanvas.width = containerWidth;
+    liveDetectionCanvas.height = containerHeight;
+    
+    ctx.clearRect(0, 0, containerWidth, containerHeight);
+    
+    // Debug: Show video vs display info
+    if (predictions.length > 0) {
+      console.log('Live detection:', {
+        video: `${videoWidth}x${videoHeight}`,
+        container: `${containerWidth}x${containerHeight}`,
+        display: `${displayWidth.toFixed(0)}x${displayHeight.toFixed(0)}`,
+        offset: `${offsetX.toFixed(0)},${offsetY.toFixed(0)}`
+      });
+    }
+    
+    // Scale factors
+    const scaleX = displayWidth / videoWidth;
+    const scaleY = displayHeight / videoHeight;
+    
+    predictions.filter(p => p.score > 0.5).forEach((pred, index) => {
+      const [x, y, width, height] = pred.bbox;
+      
+      // Scale and offset bbox
+      const scaledX = offsetX + (x * scaleX);
+      const scaledY = offsetY + (y * scaleY);
+      const scaledWidth = width * scaleX;
+      const scaledHeight = height * scaleY;
+      
+      // Draw box
+      ctx.strokeStyle = '#6366f1';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
+      
+      // Draw label
+      const label = `${translateClass(pred.class)} ${Math.round(pred.score * 100)}%`;
+      ctx.font = 'bold 14px sans-serif';
+      const labelWidth = ctx.measureText(label).width + 10;
+      
+      ctx.fillStyle = '#6366f1';
+      ctx.fillRect(scaledX, scaledY > 25 ? scaledY - 25 : scaledY + scaledHeight, labelWidth, 25);
+      
+      ctx.fillStyle = 'white';
+      ctx.fillText(label, scaledX + 5, scaledY > 25 ? scaledY - 7 : scaledY + scaledHeight + 18);
+    });
+  }
+  
   btnCapture.addEventListener('click', async () => {
+    // Stop live detection first
+    stopLiveDetection();
+    
+    // Store video dimensions before stopping
+    const videoWidth = video.videoWidth;
+    const videoHeight = video.videoHeight;
+    
     // Capture image
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    canvas.width = videoWidth;
+    canvas.height = videoHeight;
     canvas.getContext('2d').drawImage(video, 0, 0);
     capturedImageData = canvas.toDataURL('image/jpeg', 0.8);
     capturedImage.src = capturedImageData;
     
-    // Setup overlay canvas
-    overlayCanvas.width = video.videoWidth;
-    overlayCanvas.height = video.videoHeight;
-    
-    video.style.display = 'none';
+    document.getElementById('webcam-container').style.display = 'none';
     capturedPreview.style.display = 'block';
     btnCapture.style.display = 'none';
     btnRetake.style.display = 'inline-flex';
@@ -423,9 +552,81 @@ function setupEditorEvents(treasure, isNew) {
       webcamStream.getTracks().forEach(track => track.stop());
     }
     
-    // Run object detection
-    await detectObjects(capturedImage, overlayCanvas);
+    // Use live detection results directly (no re-detection needed)
+    detectedObjects = lastLivePredictions;
+    
+    if (detectedObjects.length === 0) {
+      objectsList.innerHTML = '<p class="no-objects">검출된 오브젝트가 없습니다. 다시 촬영해보세요.</p>';
+      detectedObjectsSection.style.display = 'block';
+      return;
+    }
+    
+    // Wait for image to load and layout to complete
+    await new Promise(resolve => {
+      if (capturedImage.complete) resolve();
+      else capturedImage.onload = resolve;
+    });
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    
+    // Draw bounding boxes on captured image (same logic as live detection)
+    drawCapturedDetections(detectedObjects, videoWidth, videoHeight);
+    
+    // Show detected objects list
+    renderDetectedObjects(detectedObjects);
+    detectedObjectsSection.style.display = 'block';
   });
+  
+  function drawCapturedDetections(predictions, originalWidth, originalHeight) {
+    const ctx = overlayCanvas.getContext('2d');
+    
+    // Get displayed image dimensions
+    const displayedWidth = capturedImage.clientWidth;
+    const displayedHeight = capturedImage.clientHeight;
+    
+    // Set canvas size to match displayed image
+    overlayCanvas.width = displayedWidth;
+    overlayCanvas.height = displayedHeight;
+    
+    ctx.clearRect(0, 0, displayedWidth, displayedHeight);
+    
+    // Simple scale (no offset needed since image uses width:100% with auto height)
+    const scaleX = displayedWidth / originalWidth;
+    const scaleY = displayedHeight / originalHeight;
+    
+    console.log('Captured detection draw:', {
+      original: `${originalWidth}x${originalHeight}`,
+      displayed: `${displayedWidth}x${displayedHeight}`,
+      scale: `${scaleX.toFixed(4)}, ${scaleY.toFixed(4)}`
+    });
+    
+    predictions.forEach((pred, index) => {
+      const [x, y, width, height] = pred.bbox;
+      const isSelected = selectedObject === pred.class;
+      
+      // Scale bbox
+      const scaledX = x * scaleX;
+      const scaledY = y * scaleY;
+      const scaledWidth = width * scaleX;
+      const scaledHeight = height * scaleY;
+      
+      // Draw box
+      ctx.strokeStyle = isSelected ? '#10b981' : '#6366f1';
+      ctx.lineWidth = isSelected ? 4 : 3;
+      ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
+      
+      // Draw label
+      const label = `${index + 1}. ${translateClass(pred.class)} (${Math.round(pred.score * 100)}%)`;
+      ctx.font = 'bold 14px sans-serif';
+      const labelWidth = ctx.measureText(label).width + 10;
+      const labelY = scaledY > 25 ? scaledY - 5 : scaledY + scaledHeight + 20;
+      
+      ctx.fillStyle = isSelected ? '#10b981' : '#6366f1';
+      ctx.fillRect(scaledX, labelY - 20, labelWidth, 25);
+      
+      ctx.fillStyle = 'white';
+      ctx.fillText(label, scaledX + 5, labelY - 2);
+    });
+  }
   
   async function detectObjects(imageElement, overlayCanvas) {
     showLoadingOverlay('AI 오브젝트 검출 중...');
@@ -471,6 +672,9 @@ function setupEditorEvents(treasure, isNew) {
         detectedObjectsSection.style.display = 'block';
         return;
       }
+      
+      // Wait for layout to be calculated after display change
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       
       // Draw bounding boxes
       drawDetections(overlayCanvas, detectedObjects);
@@ -1071,7 +1275,16 @@ function addSetupStyles() {
     .webcam-container video {
       width: 100%;
       height: 100%;
-      object-fit: cover;
+      object-fit: contain;  /* contain으로 변경 - 잘림 없이 비율 유지 */
+    }
+    
+    .webcam-container #live-detection-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
     }
     
     #captured-preview {
