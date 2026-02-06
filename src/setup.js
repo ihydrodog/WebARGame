@@ -238,6 +238,14 @@ function renderTreasureEditor(treasure) {
             <button class="btn btn-success" id="btn-capture" style="display: none;">📷 촬영 + AI 검출</button>
             <button class="btn btn-secondary" id="btn-retake" style="display: none;">다시 찍기</button>
           </div>
+          
+          <!-- Camera controls (shown when webcam is active) -->
+          <div id="camera-controls" style="display: none;">
+            <div class="camera-controls-row">
+              <button class="btn btn-icon" id="btn-switch-camera" title="카메라 전환">🔄 전환</button>
+              <span id="zoom-level" class="zoom-badge" style="display: none;">1.0x</span>
+            </div>
+          </div>
         </section>
         
         <!-- Riddle Selection (Improved) -->
@@ -382,35 +390,137 @@ function setupEditorEvents(treasure, isNew) {
   let liveDetectionRunning = false;
   let liveDetectionModel = null;
   let lastLivePredictions = []; // Store last live detection results
+  let currentFacingMode = 'environment'; // 'environment' = rear, 'user' = front
+  let currentZoom = 1;
+  let zoomCapabilities = { min: 1, max: 1, step: 0 }; // Populated after camera starts
   
-  btnStartWebcam.addEventListener('click', async () => {
+  const cameraControls = document.getElementById('camera-controls');
+  const btnSwitchCamera = document.getElementById('btn-switch-camera');
+  const zoomLevel = document.getElementById('zoom-level');
+  const webcamContainer = document.getElementById('webcam-container');
+  
+  async function startCamera(facingMode) {
+    // Stop existing stream
+    if (webcamStream) {
+      webcamStream.getTracks().forEach(track => track.stop());
+    }
+    stopLiveDetection();
+    
     try {
       webcamStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } 
+        video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } } 
       });
       video.srcObject = webcamStream;
+      currentFacingMode = facingMode;
       
-      // Detect if camera is mirrored (front-facing or desktop webcam)
       const track = webcamStream.getVideoTracks()[0];
       const settings = track.getSettings();
-      // Front camera ('user') or desktop webcam (no facingMode) are typically mirrored
-      isMirroredCamera = settings.facingMode === 'user' || !settings.facingMode;
-      console.log('Camera settings:', settings, 'isMirrored:', isMirroredCamera);
+      const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+      
+      console.log('Camera settings:', settings);
+      console.log('Camera capabilities:', capabilities);
+      
+      // Setup zoom capabilities
+      if (capabilities.zoom) {
+        zoomCapabilities = {
+          min: capabilities.zoom.min || 1,
+          max: capabilities.zoom.max || 1,
+          step: capabilities.zoom.step || 0.1
+        };
+      } else {
+        zoomCapabilities = { min: 1, max: 1, step: 0 };
+      }
+      currentZoom = settings.zoom || 1;
+      zoomLevel.style.display = 'none';
+      zoomLevel.textContent = `${currentZoom.toFixed(1)}x`;
+      
+      // Check if multiple cameras available for switch button
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+      btnSwitchCamera.style.display = videoDevices.length > 1 ? 'inline-flex' : 'none';
+      
+      // Show controls
       btnStartWebcam.style.display = 'none';
       btnCapture.style.display = 'inline-flex';
+      cameraControls.style.display = 'block';
       
-      // Preload model and start live detection
-      loadObjectDetectionModel().then(model => {
-        if (model) {
-          liveDetectionModel = model;
-          startLiveDetection();
-        }
-      });
+      // Start live detection
+      if (liveDetectionModel) {
+        startLiveDetection();
+      } else {
+        loadObjectDetectionModel().then(model => {
+          if (model) {
+            liveDetectionModel = model;
+            startLiveDetection();
+          }
+        });
+      }
     } catch (err) {
       alert('카메라 접근 권한이 필요합니다.');
       console.error('Webcam error:', err);
     }
+  }
+  
+  let zoomBadgeTimeout = null;
+  
+  async function applyZoom(zoom) {
+    if (!webcamStream || zoomCapabilities.max <= 1) return;
+    const track = webcamStream.getVideoTracks()[0];
+    const clamped = Math.max(zoomCapabilities.min, Math.min(zoomCapabilities.max, zoom));
+    try {
+      await track.applyConstraints({ advanced: [{ zoom: clamped }] });
+      currentZoom = clamped;
+      zoomLevel.textContent = `${clamped.toFixed(1)}x`;
+      zoomLevel.style.display = 'inline-block';
+      // Auto-hide after 1.5s
+      clearTimeout(zoomBadgeTimeout);
+      zoomBadgeTimeout = setTimeout(() => { zoomLevel.style.display = 'none'; }, 1500);
+    } catch (err) {
+      console.warn('Zoom not supported:', err);
+    }
+  }
+  
+  btnStartWebcam.addEventListener('click', () => startCamera(currentFacingMode));
+  
+  btnSwitchCamera.addEventListener('click', () => {
+    const newMode = currentFacingMode === 'environment' ? 'user' : 'environment';
+    startCamera(newMode);
   });
+  
+  // Pinch-to-zoom on webcam container
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1;
+  
+  webcamContainer.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      pinchStartDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      pinchStartZoom = currentZoom;
+    }
+  }, { passive: false });
+  
+  webcamContainer.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const scale = dist / pinchStartDist;
+      applyZoom(pinchStartZoom * scale);
+    }
+  }, { passive: false });
+  
+  // Mouse wheel zoom (desktop fallback)
+  webcamContainer.addEventListener('wheel', (e) => {
+    if (!webcamStream || zoomCapabilities.max <= 1) return;
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? -0.2 : 0.2;
+    applyZoom(currentZoom + delta);
+  }, { passive: false });
   
   // Live detection loop
   function startLiveDetection() {
@@ -452,60 +562,29 @@ function setupEditorEvents(treasure, isNew) {
   function drawLiveDetections(predictions) {
     const ctx = liveDetectionCanvas.getContext('2d');
     
-    // Get video actual dimensions
+    // Video natural dimensions
     const videoWidth = video.videoWidth;
     const videoHeight = video.videoHeight;
     
-    // Get container dimensions
-    const containerWidth = video.clientWidth;
-    const containerHeight = video.clientHeight;
+    // Displayed dimensions (video is width:100%, height auto = same aspect)
+    const displayedWidth = video.clientWidth;
+    const displayedHeight = video.clientHeight;
     
-    // Calculate actual video display area (object-fit: contain)
-    const videoAspect = videoWidth / videoHeight;
-    const containerAspect = containerWidth / containerHeight;
+    // Set canvas size to match displayed video
+    liveDetectionCanvas.width = displayedWidth;
+    liveDetectionCanvas.height = displayedHeight;
     
-    let displayWidth, displayHeight, offsetX, offsetY;
+    ctx.clearRect(0, 0, displayedWidth, displayedHeight);
     
-    if (containerAspect > videoAspect) {
-      // Container is wider - video fits height, has horizontal padding
-      displayHeight = containerHeight;
-      displayWidth = containerHeight * videoAspect;
-      offsetX = (containerWidth - displayWidth) / 2;
-      offsetY = 0;
-    } else {
-      // Container is taller - video fits width, has vertical padding
-      displayWidth = containerWidth;
-      displayHeight = containerWidth / videoAspect;
-      offsetX = 0;
-      offsetY = (containerHeight - displayHeight) / 2;
-    }
-    
-    // Set canvas size to match container
-    liveDetectionCanvas.width = containerWidth;
-    liveDetectionCanvas.height = containerHeight;
-    
-    ctx.clearRect(0, 0, containerWidth, containerHeight);
-    
-    // Debug: Show video vs display info
-    if (predictions.length > 0) {
-      console.log('Live detection:', {
-        video: `${videoWidth}x${videoHeight}`,
-        container: `${containerWidth}x${containerHeight}`,
-        display: `${displayWidth.toFixed(0)}x${displayHeight.toFixed(0)}`,
-        offset: `${offsetX.toFixed(0)},${offsetY.toFixed(0)}`
-      });
-    }
-    
-    // Scale factors
-    const scaleX = displayWidth / videoWidth;
-    const scaleY = displayHeight / videoHeight;
+    // Simple scale (no offset needed since aspect matches)
+    const scaleX = displayedWidth / videoWidth;
+    const scaleY = displayedHeight / videoHeight;
     
     predictions.filter(p => p.score > 0.5).forEach((pred, index) => {
       const [x, y, width, height] = pred.bbox;
       
-      // Scale and offset bbox
-      const scaledX = offsetX + (x * scaleX);
-      const scaledY = offsetY + (y * scaleY);
+      const scaledX = x * scaleX;
+      const scaledY = y * scaleY;
       const scaledWidth = width * scaleX;
       const scaledHeight = height * scaleY;
       
@@ -830,21 +909,14 @@ function setupEditorEvents(treasure, isNew) {
     capturedImageData = null;
     selectedObject = null;
     detectedObjects = [];
+    lastLivePredictions = [];
     capturedPreview.style.display = 'none';
     detectedObjectsSection.style.display = 'none';
     selectedObjectInfo.style.display = 'none';
-    video.style.display = 'block';
+    document.getElementById('webcam-container').style.display = '';
     btnRetake.style.display = 'none';
     
-    try {
-      webcamStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } 
-      });
-      video.srcObject = webcamStream;
-      btnCapture.style.display = 'inline-flex';
-    } catch (err) {
-      alert('카메라 접근 권한이 필요합니다.');
-    }
+    await startCamera(currentFacingMode);
   });
   
   // Riddle mode toggle
@@ -1265,7 +1337,6 @@ function addSetupStyles() {
     .webcam-container {
       position: relative;
       width: 100%;
-      aspect-ratio: 16/9;
       background: #000;
       border-radius: var(--border-radius);
       overflow: hidden;
@@ -1274,8 +1345,7 @@ function addSetupStyles() {
     
     .webcam-container video {
       width: 100%;
-      height: 100%;
-      object-fit: contain;  /* contain으로 변경 - 잘림 없이 비율 유지 */
+      display: block;
     }
     
     .webcam-container #live-detection-canvas {
@@ -1316,6 +1386,36 @@ function addSetupStyles() {
       gap: 0.5rem;
       justify-content: center;
       flex-wrap: wrap;
+    }
+    
+    .camera-controls-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.75rem;
+      padding: 0.5rem 0;
+    }
+    
+    .btn-icon {
+      padding: 0.4rem 0.75rem;
+      font-size: 0.85rem;
+      border-radius: 8px;
+      background: #f1f5f9;
+      border: 1px solid #cbd5e1;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-icon:hover {
+      background: #e2e8f0;
+    }
+    
+    .zoom-badge {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: white;
+      background: rgba(0,0,0,0.6);
+      padding: 0.2rem 0.5rem;
+      border-radius: 6px;
     }
     
     /* Object Detection */
