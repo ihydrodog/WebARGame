@@ -209,6 +209,8 @@ function renderTreasureEditor(treasure) {
             <canvas id="live-detection-canvas"></canvas>
             <canvas id="capture-canvas" style="display: none;"></canvas>
             <canvas id="detection-canvas" style="display: none;"></canvas>
+            <button class="cam-switch-btn" id="btn-switch-camera" style="display: none;" title="카메라 전환">🔄</button>
+            <span id="zoom-level" class="cam-zoom-badge" style="display: none;">1.0x</span>
           </div>
           
           <div id="captured-preview" style="display: none;">
@@ -239,13 +241,7 @@ function renderTreasureEditor(treasure) {
             <button class="btn btn-secondary" id="btn-retake" style="display: none;">다시 찍기</button>
           </div>
           
-          <!-- Camera controls (shown when webcam is active) -->
-          <div id="camera-controls" style="display: none;">
-            <div class="camera-controls-row">
-              <button class="btn btn-icon" id="btn-switch-camera" title="카메라 전환">🔄 전환</button>
-              <span id="zoom-level" class="zoom-badge" style="display: none;">1.0x</span>
-            </div>
-          </div>
+          <!-- camera controls are now inside webcam-container -->
         </section>
         
         <!-- Riddle Selection (Improved) -->
@@ -394,7 +390,6 @@ function setupEditorEvents(treasure, isNew) {
   let currentZoom = 1;
   let zoomCapabilities = { min: 1, max: 1, step: 0 }; // Populated after camera starts
   
-  const cameraControls = document.getElementById('camera-controls');
   const btnSwitchCamera = document.getElementById('btn-switch-camera');
   const zoomLevel = document.getElementById('zoom-level');
   const webcamContainer = document.getElementById('webcam-container');
@@ -437,24 +432,25 @@ function setupEditorEvents(treasure, isNew) {
       // Check if multiple cameras available for switch button
       const devices = await navigator.mediaDevices.enumerateDevices();
       const videoDevices = devices.filter(d => d.kind === 'videoinput');
-      btnSwitchCamera.style.display = videoDevices.length > 1 ? 'inline-flex' : 'none';
+      btnSwitchCamera.style.display = videoDevices.length > 1 ? 'flex' : 'none';
       
       // Show controls
       btnStartWebcam.style.display = 'none';
       btnCapture.style.display = 'inline-flex';
-      cameraControls.style.display = 'block';
       
-      // Start live detection
-      if (liveDetectionModel) {
-        startLiveDetection();
-      } else {
-        loadObjectDetectionModel().then(model => {
-          if (model) {
-            liveDetectionModel = model;
-            startLiveDetection();
-          }
-        });
-      }
+      // Wait for video to be ready, then start live detection
+      video.onloadeddata = () => {
+        if (liveDetectionModel) {
+          startLiveDetection();
+        } else {
+          loadObjectDetectionModel().then(model => {
+            if (model) {
+              liveDetectionModel = model;
+              startLiveDetection();
+            }
+          });
+        }
+      };
     } catch (err) {
       alert('카메라 접근 권한이 필요합니다.');
       console.error('Webcam error:', err);
@@ -1388,34 +1384,43 @@ function addSetupStyles() {
       flex-wrap: wrap;
     }
     
-    .camera-controls-row {
+    .cam-switch-btn {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      font-size: 1.2rem;
+      cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 0.75rem;
-      padding: 0.5rem 0;
+      backdrop-filter: blur(4px);
+      z-index: 10;
+      transition: background 0.2s;
+    }
+    .cam-switch-btn:hover {
+      background: rgba(0, 0, 0, 0.7);
     }
     
-    .btn-icon {
-      padding: 0.4rem 0.75rem;
+    .cam-zoom-badge {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
       font-size: 0.85rem;
-      border-radius: 8px;
-      background: #f1f5f9;
-      border: 1px solid #cbd5e1;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    .btn-icon:hover {
-      background: #e2e8f0;
-    }
-    
-    .zoom-badge {
-      font-size: 0.8rem;
-      font-weight: 600;
+      font-weight: 700;
       color: white;
-      background: rgba(0,0,0,0.6);
-      padding: 0.2rem 0.5rem;
-      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 0.2rem 0.6rem;
+      border-radius: 12px;
+      z-index: 10;
+      pointer-events: none;
+      backdrop-filter: blur(4px);
     }
     
     /* Object Detection */
