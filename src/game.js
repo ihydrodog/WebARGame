@@ -5,6 +5,14 @@
 
 import { loadTreasures } from './data/default-treasures.js';
 import { getRiddleById } from './data/riddles/index.js';
+import { getCocoLabel } from './utils/coco-labels.js';
+import {
+  getEmbeddingFromCrop,
+  cosineSimilarity,
+  FEATURE_SIMILARITY_THRESHOLD
+} from './utils/feature-embedding.js';
+import { loadDetectionModel, runDetection, isDetectionAvailable, pickDetectionAt } from './utils/detection.js';
+import { isSegmentAvailableForClass, getSegmentMasks, drawPredictionsWithSegments } from './utils/segment-helper.js';
 
 let container = null;
 let onBack = null;
@@ -13,6 +21,9 @@ let currentTreasureIndex = 0;
 let score = 0;
 let scoreTimer = null;
 let isGameActive = false;
+
+let arStream = null;
+let arDetectionRunning = false;
 
 /**
  * Initialize game
@@ -181,53 +192,393 @@ function showCurrentHint() {
 }
 
 /**
- * Start AR mode (simplified - marker detection simulation)
+ * Stop AR mode (stop camera stream)
+ */
+function stopARMode() {
+  if (arStream) {
+    arStream.getTracks().forEach(track => track.stop());
+    arStream = null;
+  }
+}
+
+/**
+ * Start AR mode: webcam + magnifying glass overlay. Tap to detect & select treasure.
  */
 function startARMode() {
   const arContainer = document.getElementById('ar-container');
-  
-  // For prototype, we'll simulate AR with webcam + click to find
+
+  stopARMode();
+
   arContainer.innerHTML = `
     <div class="ar-view">
       <video id="ar-video" autoplay playsinline></video>
+      <canvas id="ar-detection-canvas" class="ar-detection-canvas" aria-hidden="true"></canvas>
+      <div class="ar-touch-layer" id="ar-touch-layer">
+        <div class="magnifier-glass ar-glass" id="ar-magnifier-glass" aria-hidden="true"></div>
+      </div>
       <div class="ar-overlay">
-        <p class="ar-instruction">보물 위치를 찾으면 화면을 터치하세요!</p>
-        <button class="btn btn-success btn-large" id="btn-found">보물 발견!</button>
+        <p class="ar-instruction">돋보기로 보물을 가리킨 뒤 터치하세요</p>
       </div>
     </div>
   `;
-  
-  // Start webcam
+
   const video = document.getElementById('ar-video');
-  navigator.mediaDevices.getUserMedia({ 
-    video: { facingMode: 'environment' } 
+  const detectionCanvas = document.getElementById('ar-detection-canvas');
+  const touchLayer = document.getElementById('ar-touch-layer');
+  const glass = document.getElementById('ar-magnifier-glass');
+  glass.style.display = 'none';
+
+  arDetectionRunning = true;
+  let arModel = null;
+  (async function detectionLoop() {
+    if (!arDetectionRunning || !video || !detectionCanvas) return;
+    if (!isDetectionAvailable()) {
+      setTimeout(detectionLoop, 200);
+      return;
+    }
+    try {
+      if (video.readyState < 2 || !video.videoWidth) {
+        setTimeout(detectionLoop, 100);
+        return;
+      }
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      const dw = video.clientWidth;
+      const dh = video.clientHeight;
+      if (!dw || !dh) {
+        setTimeout(detectionLoop, 100);
+        return;
+      }
+      if (!arModel) arModel = await loadDetectionModel();
+      const predictions = await runDetection(arModel, video, { scoreThreshold: 0.5 });
+      let segmentMasks = [];
+      if (isSegmentAvailableForClass('person')) {
+        try {
+          segmentMasks = await getSegmentMasks(video);
+        } catch (_) {}
+      }
+      const ctx = detectionCanvas.getContext('2d');
+      detectionCanvas.width = dw;
+      detectionCanvas.height = dh;
+      ctx.clearRect(0, 0, dw, dh);
+      drawPredictionsWithSegments(ctx, predictions, segmentMasks, {
+        sourceWidth: vw,
+        sourceHeight: vh,
+        displayWidth: dw,
+        displayHeight: dh,
+        translateClass: getCocoLabel,
+        scoreThreshold: 0.5,
+        withIndex: false
+      });
+    } catch (err) {
+      console.warn('AR detection loop:', err);
+    }
+    setTimeout(detectionLoop, 100);
+  })();
+
+  let glassVisible = false;
+  function moveGlass(e) {
+    const rect = touchLayer.getBoundingClientRect();
+    const x = (e.clientX ?? e.touches?.[0]?.clientX ?? 0) - rect.left;
+    const y = (e.clientY ?? e.touches?.[0]?.clientY ?? 0) - rect.top;
+    if (x >= 0 && x <= rect.width && y >= 0 && y <= rect.height) {
+      glass.style.left = x + 'px';
+      glass.style.top = y + 'px';
+      glass.style.display = 'block';
+      glassVisible = true;
+    } else if (glassVisible) {
+      glass.style.display = 'none';
+      glassVisible = false;
+    }
+  }
+
+  function onTap(e) {
+    const clientX = e.clientX ?? e.changedTouches?.[0]?.clientX;
+    const clientY = e.clientY ?? e.changedTouches?.[0]?.clientY;
+    if (clientX == null || clientY == null) return;
+    tryFindTreasure(video, { clientX, clientY });
+  }
+
+  touchLayer.addEventListener('mousemove', moveGlass);
+  touchLayer.addEventListener('mouseleave', () => {
+    glass.style.display = 'none';
+    glassVisible = false;
+  });
+  touchLayer.addEventListener('click', (e) => {
+    e.preventDefault();
+    onTap(e);
+  });
+  touchLayer.addEventListener('touchmove', (e) => {
+    if (e.touches.length) {
+      e.preventDefault();
+      moveGlass(e);
+    }
+  }, { passive: false });
+  touchLayer.addEventListener('touchend', (e) => {
+    if (e.changedTouches.length) {
+      e.preventDefault();
+      onTap(e);
+    }
+  }, { passive: false });
+
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'environment' }
   }).then(stream => {
+    arStream = stream;
     video.srcObject = stream;
   }).catch(err => {
     console.error('Camera error:', err);
     alert('카메라 접근 권한이 필요합니다.');
   });
-  
-  // Found button (simulates marker detection)
-  document.getElementById('btn-found').addEventListener('click', () => {
-    onMarkerFound();
-  });
 }
 
 /**
- * Handle marker found event
+ * Tap on AR view: if treasure has detectedObject, run detection and pick at click position; else go to riddle
+ * clickEvent: { clientX, clientY } (captured at tap time)
  */
-function onMarkerFound() {
-  // Show toast
-  showToast('보물 발견! 🎁', 'success');
-  
-  // Show particles
-  showParticles();
-  
-  // Show riddle modal after short delay
+async function tryFindTreasure(video, clickEvent) {
+  const currentTreasure = gameData.items[currentTreasureIndex];
+  const targetObject = currentTreasure?.detectedObject || null;
+
+  if (!targetObject) {
+    onMarkerFound(null);
+    return;
+  }
+
+  const rect = video.getBoundingClientRect();
+  const vw = video.videoWidth || 640;
+  const vh = video.videoHeight || 480;
+  const clientX = clickEvent?.clientX ?? 0;
+  const clientY = clickEvent?.clientY ?? 0;
+
+  if (!isDetectionAvailable()) {
+    showToast('오브젝트 선택을 사용할 수 없어요.', 'error');
+    return;
+  }
+
+  showToast('검출 중...', '');
+  let model;
+  try {
+    model = await loadDetectionModel();
+  } catch (err) {
+    console.warn('COCO-SSD load failed:', err);
+    showToast('오브젝트 선택을 불러올 수 없어요.', 'error');
+    return;
+  }
+
+  const captureCanvas = document.createElement('canvas');
+  captureCanvas.width = vw;
+  captureCanvas.height = vh;
+  captureCanvas.getContext('2d').drawImage(video, 0, 0, vw, vh);
+
+  const filtered = await runDetection(model, captureCanvas, { scoreThreshold: 0.5 });
+
+  if (filtered.length === 0) {
+    showToast('보물이 보이지 않아요. 더 가까이 가서 다시 시도해보세요!', 'error');
+    return;
+  }
+
+  const hit = await pickDetectionAt(captureCanvas, rect, vw, vh, clientX, clientY, filtered, targetObject);
+  if (hit == null) {
+    showToast('그곳에는 보물이 없어요. 오브젝트 위를 눌러보세요. 🔍', 'error');
+    return;
+  }
+  if (hit.class !== targetObject) {
+    showToast('그건 아니에요! 다시 찾아보세요. 🔍', 'error');
+    return;
+  }
+  const refEmbedding = currentTreasure?.featureEmbedding;
+  if (refEmbedding && Array.isArray(refEmbedding) && refEmbedding.length > 0) {
+    showToast('대상 확인 중...', '');
+    try {
+      const candidateEmbedding = await getEmbeddingFromCrop(
+        captureCanvas, hit.bbox, vw, vh
+      );
+      const sim = cosineSimilarity(refEmbedding, candidateEmbedding);
+      if (sim >= FEATURE_SIMILARITY_THRESHOLD) {
+        onMarkerFound(targetObject);
+      } else {
+        showToast(
+          currentTreasure.featureLabel
+            ? `다른 ${getCocoLabel(targetObject)}이에요. (${currentTreasure.featureLabel}을/를 찾아보세요!)`
+            : '그건 아니에요! 다시 찾아보세요. 🔍',
+          'error'
+        );
+      }
+    } catch (err) {
+      console.warn('Feature check failed, allowing class match:', err);
+      onMarkerFound(targetObject);
+    }
+  } else {
+    onMarkerFound(targetObject);
+  }
+}
+
+/**
+ * Play short success sound (Web Audio API, no file required)
+ */
+function playSuccessSound() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.setValueAtTime(523.25, now);
+    osc.frequency.setValueAtTime(659.25, now + 0.12);
+    osc.frequency.setValueAtTime(783.99, now + 0.24);
+    osc.type = 'sine';
+    gain.gain.setValueAtTime(0.15, now);
+    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+    osc.start(now);
+    osc.stop(now + 0.4);
+  } catch (_) {}
+}
+
+/**
+ * Show treasure-found overlay: discovered object, matching visualization, sound; then particles + riddle
+ */
+function showTreasureFoundOverlay(foundObjectClass) {
+  const label = foundObjectClass ? getCocoLabel(foundObjectClass) : null;
+  const overlay = document.createElement('div');
+  overlay.className = 'treasure-found-overlay';
+  overlay.innerHTML = `
+    <div class="treasure-found-card">
+      <div class="treasure-found-title">보물 발견! 🎁</div>
+      <div class="treasure-found-object">${label != null ? `발견된 대상: <strong>${label}</strong>` : '보물을 찾았어요!'}</div>
+      ${label != null ? `
+        <div class="treasure-found-match" id="treasure-found-match">
+          <span class="match-label">선택한 대상</span>
+          <span class="match-value">${label}</span>
+          <span class="match-equals">=</span>
+          <span class="match-label">보물</span>
+          <span class="match-value">${label}</span>
+          <span class="match-check" id="treasure-match-check">✓ 매칭 성공</span>
+        </div>
+      ` : ''}
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  addTreasureFoundStyles();
+
+  playSuccessSound();
+
+  const matchEl = document.getElementById('treasure-match-check');
+  if (matchEl) {
+    matchEl.classList.add('match-visible');
+  }
+
   setTimeout(() => {
-    showRiddleModal();
-  }, 500);
+    overlay.classList.add('treasure-found-out');
+    setTimeout(() => {
+      overlay.remove();
+      showParticles();
+      setTimeout(() => showRiddleModal(), 500);
+    }, 400);
+  }, 1800);
+}
+
+function addTreasureFoundStyles() {
+  if (document.getElementById('treasure-found-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'treasure-found-styles';
+  style.textContent = `
+    .treasure-found-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 3000;
+      animation: treasure-found-bg-in 0.3s ease;
+    }
+    .treasure-found-overlay.treasure-found-out {
+      animation: treasure-found-bg-out 0.4s ease forwards;
+    }
+    @keyframes treasure-found-bg-in {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes treasure-found-bg-out {
+      from { opacity: 1; }
+      to { opacity: 0; }
+    }
+    .treasure-found-card {
+      background: linear-gradient(145deg, #1e293b 0%, #334155 100%);
+      color: white;
+      padding: 1.75rem 2rem;
+      border-radius: 16px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+      text-align: center;
+      max-width: 90%;
+      animation: treasure-found-card-in 0.4s ease;
+    }
+    @keyframes treasure-found-card-in {
+      from { opacity: 0; transform: scale(0.9) translateY(10px); }
+      to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .treasure-found-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+    }
+    .treasure-found-object {
+      font-size: 1.1rem;
+      margin-bottom: 1rem;
+      opacity: 0.95;
+    }
+    .treasure-found-object strong {
+      color: #fbbf24;
+    }
+    .treasure-found-match {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 0.35rem 0.5rem;
+      margin-top: 1rem;
+      padding: 0.75rem 1rem;
+      background: rgba(255,255,255,0.08);
+      border-radius: 12px;
+      font-size: 0.95rem;
+    }
+    .treasure-found-match .match-label {
+      color: rgba(255,255,255,0.7);
+    }
+    .treasure-found-match .match-value {
+      font-weight: 600;
+      color: #a5b4fc;
+    }
+    .treasure-found-match .match-equals {
+      color: rgba(255,255,255,0.5);
+      margin: 0 0.15rem;
+    }
+    .treasure-found-match .match-check {
+      width: 100%;
+      margin-top: 0.5rem;
+      font-weight: 700;
+      color: #34d399;
+      opacity: 0;
+      transform: scale(0.8);
+      transition: opacity 0.35s ease, transform 0.35s ease;
+    }
+    .treasure-found-match .match-check.match-visible {
+      opacity: 1;
+      transform: scale(1);
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+/**
+ * Handle marker found event (correct object selected or no object required)
+ * @param {string|null} foundObjectClass - COCO class of found object, or null if no object required
+ */
+function onMarkerFound(foundObjectClass) {
+  showTreasureFoundOverlay(foundObjectClass);
 }
 
 /**
@@ -324,6 +675,8 @@ function proceedToNext() {
       `${currentTreasureIndex + 1} / ${gameData.items.length}`;
     showCurrentHint();
     
+    // Stop AR detection and camera before replacing view
+    stopARMode();
     // Reset AR view
     const arContainer = document.getElementById('ar-container');
     arContainer.innerHTML = `
@@ -409,12 +762,7 @@ function pauseGame() {
 function stopGame() {
   stopScoreTimer();
   isGameActive = false;
-  
-  // Stop any webcam streams
-  const video = document.querySelector('#ar-video');
-  if (video && video.srcObject) {
-    video.srcObject.getTracks().forEach(track => track.stop());
-  }
+  stopARMode();
 }
 
 /**
@@ -528,6 +876,40 @@ function addGameStyles() {
       object-fit: cover;
     }
     
+    .ar-detection-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      object-fit: cover;
+    }
+    
+    .ar-touch-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      cursor: crosshair;
+      touch-action: none;
+    }
+    
+    .ar-touch-layer .ar-glass {
+      position: absolute;
+      width: 72px;
+      height: 72px;
+      transform: translate(-50%, -50%);
+      margin: 0;
+      border-radius: 50%;
+      pointer-events: none;
+      border: 4px solid rgba(30, 41, 59, 0.7);
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.9), inset 0 0 24px rgba(255,255,255,0.25);
+      background: radial-gradient(circle at 32% 32%, rgba(255,255,255,0.35), transparent 55%);
+      box-sizing: border-box;
+    }
+    
     .ar-overlay {
       position: absolute;
       bottom: 0;
@@ -536,11 +918,68 @@ function addGameStyles() {
       padding: 1rem;
       background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
       text-align: center;
+      pointer-events: none;
     }
     
     .ar-instruction {
       color: white;
+      margin: 0;
+    }
+    
+    .object-select-modal {
+      width: 90%;
+      max-width: 380px;
+      text-align: center;
+    }
+    
+    .magnifier-modal {
+      max-width: min(420px, 95vw);
+    }
+    
+    .object-select-title {
+      font-size: 1.15rem;
+      margin-bottom: 0.5rem;
+      line-height: 1.5;
+    }
+    
+    .magnifier-hint {
+      font-size: 0.9rem;
+      color: #64748b;
       margin-bottom: 1rem;
+    }
+    
+    .magnifier-stage {
+      position: relative;
+      display: inline-block;
+      margin-bottom: 1rem;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+      cursor: crosshair;
+    }
+    
+    .magnifier-canvas {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      vertical-align: top;
+    }
+    
+    .magnifier-glass {
+      position: absolute;
+      width: 72px;
+      height: 72px;
+      left: 0;
+      top: 0;
+      transform: translate(-50%, -50%);
+      margin-left: 0;
+      margin-top: 0;
+      border-radius: 50%;
+      pointer-events: none;
+      border: 4px solid rgba(30, 41, 59, 0.7);
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.9), inset 0 0 24px rgba(255,255,255,0.25);
+      background: radial-gradient(circle at 32% 32%, rgba(255,255,255,0.35), transparent 55%);
+      box-sizing: border-box;
     }
     
     .riddle-modal {

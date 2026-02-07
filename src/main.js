@@ -1,5 +1,11 @@
 import './style.css';
 
+// body-segmentation 전역 노출 (segment-helper가 person 세그먼트 사용)
+import * as bodySegmentation from '@tensorflow-models/body-segmentation';
+if (typeof window !== 'undefined') {
+  window.bodySegmentation = bodySegmentation;
+}
+
 // Import components
 import './components/riddles/index.js';
 import './components/hints/index.js';

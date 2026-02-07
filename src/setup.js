@@ -5,13 +5,33 @@
 
 import { loadTreasures, saveTreasures } from './data/default-treasures.js';
 import { riddleBank, getRiddlesByCategory, getRiddlesByDifficulty } from './data/riddles/index.js';
+import { getEmbeddingFromCrop } from './utils/feature-embedding.js';
+import { loadDetectionModel, runDetection } from './utils/detection.js';
+import { getSegmentMasks, drawPredictionsWithSegments, isSegmentAvailableForClass } from './utils/segment-helper.js';
+
+/**
+ * Resolves when the video has valid dimensions and at least one frame has been painted (avoids first-frame no detection).
+ * @param {HTMLVideoElement} video
+ * @returns {Promise<void>}
+ */
+function waitForVideoReady(video) {
+  return new Promise((resolve) => {
+    function check() {
+      if (video.videoWidth && video.videoHeight && video.clientWidth && video.clientHeight) {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+        return;
+      }
+      requestAnimationFrame(check);
+    }
+    if (video.readyState >= 2) check();
+    else video.onloadeddata = check;
+  });
+}
 
 let container = null;
 let onBack = null;
 let treasures = [];
 let currentTreasureIndex = 0;
-let cocoModel = null;
-let cocoModelLoadPromise = null;
 
 /**
  * Initialize setup screen
@@ -30,28 +50,15 @@ export function initSetup(containerEl, backCallback) {
 }
 
 /**
- * Load COCO-SSD model for object detection
+ * Load COCO-SSD model for object detection (공통 detection 모듈 사용)
  * @param {boolean} [silent=false] - If true, preload without showing loading overlay
  */
 async function loadObjectDetectionModel(silent = false) {
-  if (cocoModel) return cocoModel;
-  
-  if (!cocoModelLoadPromise) {
-    cocoModelLoadPromise = (async () => {
-      try {
-        return await cocoSsd.load();
-      } catch (err) {
-        console.error('Failed to load COCO-SSD model:', err);
-        return null;
-      }
-    })();
-  }
-  
   try {
     if (!silent) showLoadingOverlay('AI 모델 로딩 중...');
-    cocoModel = await cocoModelLoadPromise;
+    const model = await loadDetectionModel();
     if (!silent) hideLoadingOverlay();
-    return cocoModel;
+    return model;
   } catch (err) {
     if (!silent) hideLoadingOverlay();
     return null;
@@ -262,6 +269,12 @@ function renderTreasureEditor(treasure) {
               <strong id="selected-object-name"></strong>
               <button class="btn btn-small btn-secondary" id="btn-clear-selection">취소</button>
             </div>
+            <div class="form-group" style="margin-top: 0.5rem;">
+              <label class="form-label checkbox-label">
+                <input type="checkbox" id="feature-limit-checkbox" ${(isNew || treasure.featureEmbedding?.length) ? 'checked' : ''}>
+                <span>대상 한정 – 같은 종류 중 선택한 대상만 인정 (피처 비교)</span>
+              </label>
+            </div>
           </div>
           
           <div class="webcam-controls">
@@ -384,6 +397,10 @@ function setupEditorEvents(treasure, isNew) {
   let capturedImageData = treasure.capturedImage || null;
   let detectedObjects = [];
   let selectedObject = treasure.detectedObject || null;
+  let selectedDetectionIndex = null; // which detection (e.g. which person) when multiple same class
+  let captureWidth = 0;
+  let captureHeight = 0;
+  let lastSegmentMasksForCaptured = []; // segment masks for captured image (UI 그리기용)
   let selectedRiddleId = treasure.riddleId || null;
   let isMirroredCamera = false; // Track if camera is mirrored (front-facing)
   
@@ -410,7 +427,15 @@ function setupEditorEvents(treasure, isNew) {
   const objectsList = document.getElementById('objects-list');
   const selectedObjectInfo = document.getElementById('selected-object-info');
   const selectedObjectName = document.getElementById('selected-object-name');
-  
+  const featureLimitCheckbox = document.getElementById('feature-limit-checkbox');
+  const featureLabelWrap = document.getElementById('feature-label-wrap');
+
+  function updateFeatureLabelWrapVisibility() {
+    if (featureLabelWrap) featureLabelWrap.style.display = featureLimitCheckbox?.checked ? 'block' : 'none';
+  }
+  updateFeatureLabelWrapVisibility();
+  featureLimitCheckbox?.addEventListener('change', updateFeatureLabelWrapVisibility);
+
   let liveDetectionRunning = false;
   let liveDetectionModel = null;
   let lastLivePredictions = []; // Store last live detection results
@@ -484,19 +509,16 @@ function setupEditorEvents(treasure, isNew) {
         btnCaptureDesktop.style.display = 'inline-flex';
       }
       
-      // Wait for video to be ready, then start live detection
-      video.onloadeddata = () => {
-        if (liveDetectionModel) {
-          startLiveDetection();
-        } else {
-          loadObjectDetectionModel().then(model => {
-            if (model) {
-              liveDetectionModel = model;
-              startLiveDetection();
-            }
-          });
-        }
-      };
+      // Start live detection when video is ready (dimensions + 1 paint frame). Single async pipeline.
+      waitForVideoReady(video)
+        .then(() => loadObjectDetectionModel())
+        .then((model) => {
+          if (model) {
+            liveDetectionModel = model;
+            startLiveDetection();
+          }
+        })
+        .catch(() => {});
     } catch (err) {
       alert('카메라 접근 권한이 필요합니다.');
       console.error('Webcam error:', err);
@@ -584,16 +606,22 @@ function setupEditorEvents(treasure, isNew) {
         return;
       }
       
-      // Check video is ready
-      if (video.readyState < 2) {
+      // Wait for video to have dimensions and at least one frame (fixes first run no detection)
+      if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
         requestAnimationFrame(detectFrame);
         return;
       }
       
       try {
-        const predictions = await liveDetectionModel.detect(video);
-        lastLivePredictions = predictions.filter(p => p.score > 0.5); // Save for capture
-        drawLiveDetections(predictions);
+        const predictions = await runDetection(liveDetectionModel, video, { scoreThreshold: 0.5 });
+        lastLivePredictions = predictions;
+        let segmentMasks = [];
+        if (isSegmentAvailableForClass('person')) {
+          try {
+            segmentMasks = await getSegmentMasks(video);
+          } catch (_) {}
+        }
+        drawLiveDetections(predictions, segmentMasks);
       } catch (err) {
         console.error('Live detection error:', err);
       }
@@ -619,55 +647,28 @@ function setupEditorEvents(treasure, isNew) {
   const roomName = document.getElementById('room-name');
   const roomObjects = document.getElementById('room-objects');
   
-  function drawLiveDetections(predictions) {
-    const ctx = liveDetectionCanvas.getContext('2d');
-    
-    // Video natural dimensions
+  function drawLiveDetections(predictions, segmentMasks = []) {
     const videoWidth = video.videoWidth;
     const videoHeight = video.videoHeight;
-    
-    // Displayed dimensions (video is width:100%, height auto = same aspect)
     const displayedWidth = video.clientWidth;
     const displayedHeight = video.clientHeight;
-    
-    // Set canvas size to match displayed video
+    if (!videoWidth || !videoHeight || !displayedWidth || !displayedHeight) {
+      updateRoomInfo(predictions);
+      return;
+    }
+    const ctx = liveDetectionCanvas.getContext('2d');
     liveDetectionCanvas.width = displayedWidth;
     liveDetectionCanvas.height = displayedHeight;
-    
     ctx.clearRect(0, 0, displayedWidth, displayedHeight);
-    
-    // Simple scale (no offset needed since aspect matches)
-    const scaleX = displayedWidth / videoWidth;
-    const scaleY = displayedHeight / videoHeight;
-    
-    const filtered = predictions.filter(p => p.score > 0.5);
-    
-    filtered.forEach((pred, index) => {
-      const [x, y, width, height] = pred.bbox;
-      
-      const scaledX = x * scaleX;
-      const scaledY = y * scaleY;
-      const scaledWidth = width * scaleX;
-      const scaledHeight = height * scaleY;
-      
-      // Draw box
-      ctx.strokeStyle = '#6366f1';
-      ctx.lineWidth = 3;
-      ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
-      
-      // Draw label
-      const label = `${translateClass(pred.class)} ${Math.round(pred.score * 100)}%`;
-      ctx.font = 'bold 14px sans-serif';
-      const labelWidth = ctx.measureText(label).width + 10;
-      
-      ctx.fillStyle = '#6366f1';
-      ctx.fillRect(scaledX, scaledY > 25 ? scaledY - 25 : scaledY + scaledHeight, labelWidth, 25);
-      
-      ctx.fillStyle = 'white';
-      ctx.fillText(label, scaledX + 5, scaledY > 25 ? scaledY - 7 : scaledY + scaledHeight + 18);
+    drawPredictionsWithSegments(ctx, predictions, segmentMasks, {
+      sourceWidth: videoWidth,
+      sourceHeight: videoHeight,
+      displayWidth: displayedWidth,
+      displayHeight: displayedHeight,
+      translateClass,
+      scoreThreshold: 0.5,
+      withIndex: false
     });
-    
-    // Update room info overlay
     updateRoomInfo(predictions);
   }
   
@@ -710,6 +711,8 @@ function setupEditorEvents(treasure, isNew) {
     const videoHeight = video.videoHeight;
     
     // Capture image
+    captureWidth = videoWidth;
+    captureHeight = videoHeight;
     canvas.width = videoWidth;
     canvas.height = videoHeight;
     canvas.getContext('2d').drawImage(video, 0, 0);
@@ -736,16 +739,39 @@ function setupEditorEvents(treasure, isNew) {
       return;
     }
     
-    // Wait for image to load and layout to complete
+    // Wait for image to load
     await new Promise(resolve => {
       if (capturedImage.complete) resolve();
       else capturedImage.onload = resolve;
     });
+    // Wait for displayed dimensions (layout after display:block) so bbox drawing works first time
+    await new Promise((resolve) => {
+      let frames = 0;
+      const maxFrames = 60;
+      function check() {
+        if (capturedImage.clientWidth > 0 && capturedImage.clientHeight > 0) {
+          resolve();
+          return;
+        }
+        if (++frames >= maxFrames) {
+          resolve();
+          return;
+        }
+        requestAnimationFrame(check);
+      }
+      requestAnimationFrame(check);
+    });
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    
-    // Draw bounding boxes on captured image (same logic as live detection)
-    drawCapturedDetections(detectedObjects, videoWidth, videoHeight);
-    
+    if (isSegmentAvailableForClass('person')) {
+      try {
+        lastSegmentMasksForCaptured = await getSegmentMasks(capturedImage);
+      } catch (_) {
+        lastSegmentMasksForCaptured = [];
+      }
+    } else {
+      lastSegmentMasksForCaptured = [];
+    }
+    drawCapturedDetections(detectedObjects, videoWidth, videoHeight, lastSegmentMasksForCaptured);
     // Show detected objects list
     renderDetectedObjects(detectedObjects);
     detectedObjectsSection.style.display = 'block';
@@ -754,55 +780,31 @@ function setupEditorEvents(treasure, isNew) {
   btnCapture.addEventListener('click', performCapture);
   btnCaptureDesktop.addEventListener('click', performCapture);
   
-  function drawCapturedDetections(predictions, originalWidth, originalHeight) {
-    const ctx = overlayCanvas.getContext('2d');
-    
-    // Get displayed image dimensions
+  function drawCapturedDetections(predictions, originalWidth, originalHeight, segmentMasks = []) {
     const displayedWidth = capturedImage.clientWidth;
     const displayedHeight = capturedImage.clientHeight;
-    
-    // Set canvas size to match displayed image
+    if (!displayedWidth || !displayedHeight || !originalWidth || !originalHeight) return;
+    const ctx = overlayCanvas.getContext('2d');
     overlayCanvas.width = displayedWidth;
     overlayCanvas.height = displayedHeight;
-    
     ctx.clearRect(0, 0, displayedWidth, displayedHeight);
-    
-    // Simple scale (no offset needed since image uses width:100% with auto height)
-    const scaleX = displayedWidth / originalWidth;
-    const scaleY = displayedHeight / originalHeight;
-    
-    console.log('Captured detection draw:', {
-      original: `${originalWidth}x${originalHeight}`,
-      displayed: `${displayedWidth}x${displayedHeight}`,
-      scale: `${scaleX.toFixed(4)}, ${scaleY.toFixed(4)}`
-    });
-    
-    predictions.forEach((pred, index) => {
-      const [x, y, width, height] = pred.bbox;
-      const isSelected = selectedObject === pred.class;
-      
-      // Scale bbox
-      const scaledX = x * scaleX;
-      const scaledY = y * scaleY;
-      const scaledWidth = width * scaleX;
-      const scaledHeight = height * scaleY;
-      
-      // Draw box
-      ctx.strokeStyle = isSelected ? '#10b981' : '#6366f1';
-      ctx.lineWidth = isSelected ? 4 : 3;
-      ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
-      
-      // Draw label
-      const label = `${index + 1}. ${translateClass(pred.class)} (${Math.round(pred.score * 100)}%)`;
-      ctx.font = 'bold 14px sans-serif';
-      const labelWidth = ctx.measureText(label).width + 10;
-      const labelY = scaledY > 25 ? scaledY - 5 : scaledY + scaledHeight + 20;
-      
-      ctx.fillStyle = isSelected ? '#10b981' : '#6366f1';
-      ctx.fillRect(scaledX, labelY - 20, labelWidth, 25);
-      
-      ctx.fillStyle = 'white';
-      ctx.fillText(label, scaledX + 5, labelY - 2);
+
+    drawPredictionsWithSegments(ctx, predictions, segmentMasks, {
+      sourceWidth: originalWidth,
+      sourceHeight: originalHeight,
+      displayWidth: displayedWidth,
+      displayHeight: displayedHeight,
+      translateClass,
+      scoreThreshold: 0,
+      withIndex: true,
+      getStyle: (pred) => {
+        const isSelected = selectedObject === pred.class;
+        return {
+          fillStyle: isSelected ? 'rgba(16, 185, 129, 0.25)' : 'rgba(99, 102, 241, 0.2)',
+          strokeStyle: isSelected ? '#10b981' : '#6366f1',
+          lineWidth: isSelected ? 4 : 3
+        };
+      }
     });
   }
   
@@ -823,27 +825,9 @@ function setupEditorEvents(treasure, isNew) {
         else imageElement.onload = resolve;
       });
       
-      // Debug: Log the input image to model
-      console.log('Model input image:', {
-        element: imageElement.tagName,
-        src: imageElement.src.substring(0, 100) + '...',
-        naturalSize: `${imageElement.naturalWidth}x${imageElement.naturalHeight}`,
-        displayedSize: `${imageElement.clientWidth}x${imageElement.clientHeight}`
-      });
-      
-      // Debug: Draw the model input image to a debug canvas
-      const debugCanvas = document.createElement('canvas');
-      debugCanvas.width = imageElement.naturalWidth;
-      debugCanvas.height = imageElement.naturalHeight;
-      debugCanvas.getContext('2d').drawImage(imageElement, 0, 0);
-      console.log('Model input image (open in new tab):', debugCanvas.toDataURL('image/jpeg', 0.5));
-      
-      const predictions = await model.detect(imageElement);
+      const predictions = await runDetection(model, imageElement, { scoreThreshold: 0.3 });
       hideLoadingOverlay();
-      
-      // Show all detections for debugging (lower threshold)
-      detectedObjects = predictions.filter(p => p.score > 0.3);
-      console.log('All predictions:', predictions);
+      detectedObjects = predictions;
       
       if (detectedObjects.length === 0) {
         objectsList.innerHTML = '<p class="no-objects">검출된 오브젝트가 없습니다. 다시 촬영해보세요.</p>';
@@ -853,8 +837,15 @@ function setupEditorEvents(treasure, isNew) {
       
       // Wait for layout to be calculated after display change
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      
-      // Draw bounding boxes
+      if (isSegmentAvailableForClass('person')) {
+        try {
+          lastSegmentMasksForCaptured = await getSegmentMasks(imageElement);
+        } catch (_) {
+          lastSegmentMasksForCaptured = [];
+        }
+      } else {
+        lastSegmentMasksForCaptured = [];
+      }
       drawDetections(overlayCanvas, detectedObjects);
       
       // Show detected objects list
@@ -870,87 +861,29 @@ function setupEditorEvents(treasure, isNew) {
   
   function drawDetections(canvas, predictions) {
     const ctx = canvas.getContext('2d');
-    
-    // Get image dimensions
     const naturalWidth = capturedImage.naturalWidth;
     const naturalHeight = capturedImage.naturalHeight;
     const displayedWidth = capturedImage.clientWidth;
     const displayedHeight = capturedImage.clientHeight;
-    
-    // Debug: Check all dimensions
-    console.log('drawDetections dimensions:', {
-      natural: `${naturalWidth}x${naturalHeight}`,
-      displayed: `${displayedWidth}x${displayedHeight}`,
-      canvas_before: `${canvas.width}x${canvas.height}`,
-      capturedImage_offsetSize: `${capturedImage.offsetWidth}x${capturedImage.offsetHeight}`,
-      capturedImage_getBoundingClientRect: capturedImage.getBoundingClientRect()
-    });
-    
-    // Set canvas size to match the displayed image size
     canvas.width = displayedWidth;
     canvas.height = displayedHeight;
-    
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
-    // Scale factor: displayed size / natural size
-    const scaleX = displayedWidth / naturalWidth;
-    const scaleY = displayedHeight / naturalHeight;
-    
-    console.log('Scale factors:', { scaleX, scaleY });
-    
-    // Debug: Draw test boxes at known positions
-    ctx.strokeStyle = 'yellow';
-    ctx.lineWidth = 2;
-    // Box at top-left (10%, 10%)
-    ctx.strokeRect(displayedWidth * 0.1, displayedHeight * 0.1, 50, 50);
-    ctx.fillStyle = 'yellow';
-    ctx.font = '12px sans-serif';
-    ctx.fillText('10%,10%', displayedWidth * 0.1, displayedHeight * 0.1 - 5);
-    
-    // Box at bottom-right (70%, 70%)
-    ctx.strokeStyle = 'lime';
-    ctx.strokeRect(displayedWidth * 0.7, displayedHeight * 0.7, 50, 50);
-    ctx.fillStyle = 'lime';
-    ctx.fillText('70%,70%', displayedWidth * 0.7, displayedHeight * 0.7 - 5);
-    
-    predictions.forEach((pred, index) => {
-      const [x, y, width, height] = pred.bbox;
-      const isSelected = selectedObject === pred.class;
-      
-      // Debug: log raw detection
-      console.log(`Detection ${index}:`, {
-        class: pred.class,
-        score: pred.score,
-        bbox: { x, y, width, height },
-        percentOfImage: { 
-          x: `${(x/naturalWidth*100).toFixed(1)}%`, 
-          y: `${(y/naturalHeight*100).toFixed(1)}%` 
-        }
-      });
-      
-      // Scale bbox coordinates to match displayed image
-      // Note: No mirroring needed - capturedImage displays raw data without CSS transform
-      const scaledX = x * scaleX;
-      const scaledY = y * scaleY;
-      const scaledWidth = width * scaleX;
-      const scaledHeight = height * scaleY;
-      
-      // Draw box
-      ctx.strokeStyle = isSelected ? '#10b981' : '#6366f1';
-      ctx.lineWidth = isSelected ? 4 : 2;
-      ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
-      
-      // Draw label background
-      ctx.fillStyle = isSelected ? '#10b981' : '#6366f1';
-      const label = `${index + 1}. ${translateClass(pred.class)} (${Math.round(pred.score * 100)}%)`;
-      ctx.font = 'bold 14px sans-serif';
-      const labelWidth = ctx.measureText(label).width + 10;
-      const labelY = scaledY > 25 ? scaledY - 5 : scaledY + scaledHeight + 20;
-      ctx.fillRect(scaledX, labelY - 20, labelWidth, 25);
-      
-      // Draw label text
-      ctx.fillStyle = 'white';
-      ctx.fillText(label, scaledX + 5, labelY - 2);
+    drawPredictionsWithSegments(ctx, predictions, lastSegmentMasksForCaptured || [], {
+      sourceWidth: naturalWidth,
+      sourceHeight: naturalHeight,
+      displayWidth: displayedWidth,
+      displayHeight: displayedHeight,
+      translateClass,
+      scoreThreshold: 0,
+      withIndex: true,
+      getStyle: (pred) => {
+        const isSelected = selectedObject === pred.class;
+        return {
+          fillStyle: isSelected ? 'rgba(16, 185, 129, 0.25)' : 'rgba(99, 102, 241, 0.2)',
+          strokeStyle: isSelected ? '#10b981' : '#6366f1',
+          lineWidth: isSelected ? 4 : 2
+        };
+      }
     });
   }
   
@@ -968,17 +901,20 @@ function setupEditorEvents(treasure, isNew) {
     objectsList.querySelectorAll('.object-card').forEach(card => {
       card.addEventListener('click', () => {
         const objectClass = card.dataset.class;
-        selectObject(objectClass);
+        const index = card.dataset.index != null ? parseInt(card.dataset.index, 10) : null;
+        selectObject(objectClass, index);
       });
     });
   }
   
-  function selectObject(objectClass) {
+  function selectObject(objectClass, index) {
     selectedObject = objectClass;
+    selectedDetectionIndex = index;
     
     // Update UI
     objectsList.querySelectorAll('.object-card').forEach(card => {
-      card.classList.toggle('selected', card.dataset.class === objectClass);
+      const match = card.dataset.class === objectClass && parseInt(card.dataset.index, 10) === index;
+      card.classList.toggle('selected', match);
     });
     
     // Show selected info
@@ -997,6 +933,7 @@ function setupEditorEvents(treasure, isNew) {
   
   document.getElementById('btn-clear-selection')?.addEventListener('click', () => {
     selectedObject = null;
+    selectedDetectionIndex = null;
     selectedObjectInfo.style.display = 'none';
     objectsList.querySelectorAll('.object-card').forEach(card => {
       card.classList.remove('selected');
@@ -1007,6 +944,9 @@ function setupEditorEvents(treasure, isNew) {
   btnRetake.addEventListener('click', async () => {
     capturedImageData = null;
     selectedObject = null;
+    selectedDetectionIndex = null;
+    captureWidth = 0;
+    captureHeight = 0;
     detectedObjects = [];
     lastLivePredictions = [];
     capturedPreview.style.display = 'none';
@@ -1106,11 +1046,11 @@ function setupEditorEvents(treasure, isNew) {
   });
   
   // Save treasure
-  document.getElementById('btn-save-treasure').addEventListener('click', () => {
+  document.getElementById('btn-save-treasure').addEventListener('click', async () => {
     const name = document.getElementById('treasure-name').value.trim();
     
     if (!name) {
-      alert('보물 이름을 입력하세요.');
+      showSetupToast('보물 이름을 입력하세요.', 'error');
       return;
     }
     
@@ -1120,7 +1060,7 @@ function setupEditorEvents(treasure, isNew) {
     
     if (riddleMode.value === 'bank') {
       if (!selectedRiddleId) {
-        alert('문제를 선택하세요.');
+        showSetupToast('문제를 선택하세요.', 'error');
         return;
       }
       riddleId = selectedRiddleId;
@@ -1130,7 +1070,7 @@ function setupEditorEvents(treasure, isNew) {
       const type = document.getElementById('custom-riddle-type').value;
       
       if (!question || !answer) {
-        alert('문제와 정답을 입력하세요.');
+        showSetupToast('문제와 정답을 입력하세요.', 'error');
         return;
       }
       
@@ -1148,7 +1088,8 @@ function setupEditorEvents(treasure, isNew) {
       hint.config.value = document.getElementById('hint-text').value.trim();
     }
     
-    // Create treasure object
+    const featureLimitEnabled = document.getElementById('feature-limit-checkbox')?.checked ?? true;
+
     const newTreasure = {
       id: treasure.id || `treasure-${Date.now()}`,
       order: currentTreasureIndex + 1,
@@ -1160,25 +1101,55 @@ function setupEditorEvents(treasure, isNew) {
       riddleId: riddleId,
       hint: hint
     };
-    
-    // Save
+
+    if (featureLimitEnabled) {
+      if (selectedDetectionIndex != null && detectedObjects[selectedDetectionIndex] && capturedImageData) {
+        try {
+          if (!capturedImage.complete) {
+            await new Promise(resolve => {
+              capturedImage.onload = resolve;
+              capturedImage.onerror = resolve;
+            });
+          }
+          const w = captureWidth || capturedImage.naturalWidth;
+          const h = captureHeight || capturedImage.naturalHeight;
+          if (w && h) {
+            const refCanvas = document.createElement('canvas');
+            refCanvas.width = w;
+            refCanvas.height = h;
+            const refCtx = refCanvas.getContext('2d');
+            refCtx.drawImage(capturedImage, 0, 0);
+            newTreasure.featureEmbedding = await getEmbeddingFromCrop(
+              refCanvas,
+              detectedObjects[selectedDetectionIndex].bbox,
+              w,
+              h
+            );
+          } else if (treasure.featureEmbedding) {
+            newTreasure.featureEmbedding = treasure.featureEmbedding;
+          }
+        } catch (err) {
+          console.warn('Feature embedding failed:', err);
+          if (treasure.featureEmbedding) newTreasure.featureEmbedding = treasure.featureEmbedding;
+        }
+      } else if (treasure.featureEmbedding) {
+        newTreasure.featureEmbedding = treasure.featureEmbedding;
+      }
+    }
+
     if (!treasures.items) {
       treasures.items = [];
     }
-    
     if (isNew) {
       treasures.items.push(newTreasure);
     } else {
       treasures.items[currentTreasureIndex] = newTreasure;
     }
-    
     saveTreasures(treasures);
-    
-    // Stop webcam
+
     if (webcamStream) {
       webcamStream.getTracks().forEach(track => track.stop());
     }
-    
     renderSetupHome();
   });
 }
@@ -1403,13 +1374,38 @@ function deleteTreasure(index) {
 }
 
 /**
+ * Show toast message (setup screen)
+ */
+function showSetupToast(message, type = '') {
+  document.querySelector('.setup-toast')?.remove();
+  const toast = document.createElement('div');
+  toast.className = `setup-toast ${type}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 2500);
+}
+
+/**
  * Save game settings
  */
 function saveSettings() {
-  treasures.initialScore = parseInt(document.getElementById('initial-score').value) || 1000;
-  treasures.scoreDecayPerSecond = parseFloat(document.getElementById('score-decay').value) || 1;
-  saveTreasures(treasures);
-  alert('설정이 저장되었습니다.');
+  const btn = document.getElementById('btn-save-settings');
+  if (!btn) return;
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '저장 중...';
+  try {
+    treasures.initialScore = parseInt(document.getElementById('initial-score').value) || 1000;
+    treasures.scoreDecayPerSecond = parseFloat(document.getElementById('score-decay').value) || 1;
+    saveTreasures(treasures);
+    showSetupToast('설정이 저장되었습니다.', 'success');
+  } catch (err) {
+    console.error('Save settings error:', err);
+    showSetupToast('저장에 실패했습니다. 다시 시도해주세요.', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
 }
 
 /**
@@ -1421,6 +1417,26 @@ function addSetupStyles() {
   const style = document.createElement('style');
   style.id = 'setup-styles';
   style.textContent = `
+    .setup-toast {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 0.75rem 1.5rem;
+      border-radius: var(--border-radius, 8px);
+      background: #1e293b;
+      color: white;
+      font-size: 0.95rem;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+      z-index: 10000;
+      animation: setup-toast-in 0.25s ease;
+    }
+    .setup-toast.success { background: #059669; }
+    .setup-toast.error { background: #dc2626; }
+    @keyframes setup-toast-in {
+      from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+      to { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
     .setup-screen {
       min-height: 100vh;
       background: var(--bg-color);
@@ -1755,6 +1771,17 @@ function addSetupStyles() {
     .object-card.selected {
       border-color: var(--success-color);
       background: #d1fae5;
+    }
+    
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      cursor: pointer;
+    }
+    .checkbox-label input[type="checkbox"] {
+      width: 1.1rem;
+      height: 1.1rem;
     }
     
     .object-number {

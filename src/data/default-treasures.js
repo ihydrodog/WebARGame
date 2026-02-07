@@ -13,6 +13,9 @@
  *   id: string,                  // Unique identifier
  *   order: number,               // Sequence order (1..n)
  *   name: string,                // Display name
+ *   detectedObject?: string,     // COCO-SSD class (e.g. "person")
+ *   featureLabel?: string,       // Optional: specific target label (e.g. "엄마", "아빠")
+ *   featureEmbedding?: number[], // Optional: reference embedding for feature match
  *   marker: {
  *     type: 'pattern' | 'nft',
  *     patternUrl?: string,       // .patt file URL (for pattern)
