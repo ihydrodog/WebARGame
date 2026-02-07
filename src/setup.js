@@ -11,6 +11,7 @@ let onBack = null;
 let treasures = [];
 let currentTreasureIndex = 0;
 let cocoModel = null;
+let cocoModelLoadPromise = null;
 
 /**
  * Initialize setup screen
@@ -23,22 +24,36 @@ export function initSetup(containerEl, backCallback) {
   treasures = loadTreasures();
   
   renderSetupHome();
+  
+  // Preload object detection model so it's ready when user opens camera (silent, no overlay)
+  loadObjectDetectionModel(true).catch(() => {});
 }
 
 /**
  * Load COCO-SSD model for object detection
+ * @param {boolean} [silent=false] - If true, preload without showing loading overlay
  */
-async function loadObjectDetectionModel() {
+async function loadObjectDetectionModel(silent = false) {
   if (cocoModel) return cocoModel;
   
+  if (!cocoModelLoadPromise) {
+    cocoModelLoadPromise = (async () => {
+      try {
+        return await cocoSsd.load();
+      } catch (err) {
+        console.error('Failed to load COCO-SSD model:', err);
+        return null;
+      }
+    })();
+  }
+  
   try {
-    showLoadingOverlay('AI 모델 로딩 중...');
-    cocoModel = await cocoSsd.load();
-    hideLoadingOverlay();
+    if (!silent) showLoadingOverlay('AI 모델 로딩 중...');
+    cocoModel = await cocoModelLoadPromise;
+    if (!silent) hideLoadingOverlay();
     return cocoModel;
   } catch (err) {
-    hideLoadingOverlay();
-    console.error('Failed to load COCO-SSD model:', err);
+    if (!silent) hideLoadingOverlay();
     return null;
   }
 }
@@ -204,13 +219,27 @@ function renderTreasureEditor(treasure) {
           <h2>위치 촬영 (웹캠) + AI 오브젝트 검출</h2>
           <p class="hint-text">촬영 후 AI가 오브젝트를 검출합니다. 원하는 오브젝트를 선택하세요!</p>
           
-          <div class="webcam-container" id="webcam-container">
-            <video id="webcam-preview" autoplay playsinline></video>
-            <canvas id="live-detection-canvas"></canvas>
-            <canvas id="capture-canvas" style="display: none;"></canvas>
-            <canvas id="detection-canvas" style="display: none;"></canvas>
-            <button class="cam-switch-btn" id="btn-switch-camera" style="display: none;" title="카메라 전환">🔄</button>
-            <span id="zoom-level" class="cam-zoom-badge" style="display: none;">1.0x</span>
+          <!-- Fullscreen camera modal (mobile) / inline (desktop) -->
+          <div id="camera-fullscreen-modal" class="camera-modal">
+            <div class="camera-modal-inner">
+              <div class="webcam-container" id="webcam-container">
+                <video id="webcam-preview" autoplay playsinline></video>
+                <canvas id="live-detection-canvas"></canvas>
+                <canvas id="capture-canvas" style="display: none;"></canvas>
+                <canvas id="detection-canvas" style="display: none;"></canvas>
+                <div id="room-info-overlay" class="room-info-overlay" style="display: none;">
+                  <div class="room-info-room"><span id="room-icon">🏠</span> <span id="room-name">감지 중...</span></div>
+                  <div class="room-info-objects" id="room-objects"></div>
+                </div>
+                <button class="cam-switch-btn" id="btn-switch-camera" style="display: none;" title="카메라 전환">🔄</button>
+                <span id="zoom-level" class="cam-zoom-badge" style="display: none;">1.0x</span>
+              </div>
+              <div class="camera-modal-controls">
+                <button class="cam-modal-close" id="btn-camera-close" title="닫기">✕</button>
+                <button class="cam-modal-capture" id="btn-capture">📷</button>
+                <div class="cam-modal-spacer"></div>
+              </div>
+            </div>
           </div>
           
           <div id="captured-preview" style="display: none;">
@@ -237,11 +266,9 @@ function renderTreasureEditor(treasure) {
           
           <div class="webcam-controls">
             <button class="btn btn-primary" id="btn-start-webcam">카메라 시작</button>
-            <button class="btn btn-success" id="btn-capture" style="display: none;">📷 촬영 + AI 검출</button>
+            <button class="btn btn-success desktop-only-capture" id="btn-capture-desktop" style="display: none;">📷 촬영 + AI 검출</button>
             <button class="btn btn-secondary" id="btn-retake" style="display: none;">다시 찍기</button>
           </div>
-          
-          <!-- camera controls are now inside webcam-container -->
         </section>
         
         <!-- Riddle Selection (Improved) -->
@@ -377,6 +404,7 @@ function setupEditorEvents(treasure, isNew) {
   const capturedImage = document.getElementById('captured-image');
   const btnStartWebcam = document.getElementById('btn-start-webcam');
   const btnCapture = document.getElementById('btn-capture');
+  const btnCaptureDesktop = document.getElementById('btn-capture-desktop');
   const btnRetake = document.getElementById('btn-retake');
   const detectedObjectsSection = document.getElementById('detected-objects');
   const objectsList = document.getElementById('objects-list');
@@ -393,6 +421,21 @@ function setupEditorEvents(treasure, isNew) {
   const btnSwitchCamera = document.getElementById('btn-switch-camera');
   const zoomLevel = document.getElementById('zoom-level');
   const webcamContainer = document.getElementById('webcam-container');
+  const cameraModal = document.getElementById('camera-fullscreen-modal');
+  const btnCameraClose = document.getElementById('btn-camera-close');
+  const isMobile = /Android|iPhone|iPod|Windows Phone/i.test(navigator.userAgent);
+  
+  function openCameraModal() {
+    if (isMobile) {
+      cameraModal.classList.add('fullscreen');
+      document.body.style.overflow = 'hidden';
+    }
+  }
+  
+  function closeCameraModal() {
+    cameraModal.classList.remove('fullscreen');
+    document.body.style.overflow = '';
+  }
   
   async function startCamera(facingMode) {
     // Stop existing stream
@@ -400,6 +443,7 @@ function setupEditorEvents(treasure, isNew) {
       webcamStream.getTracks().forEach(track => track.stop());
     }
     stopLiveDetection();
+    openCameraModal();
     
     try {
       webcamStream = await navigator.mediaDevices.getUserMedia({ 
@@ -436,7 +480,9 @@ function setupEditorEvents(treasure, isNew) {
       
       // Show controls
       btnStartWebcam.style.display = 'none';
-      btnCapture.style.display = 'inline-flex';
+      if (!isMobile) {
+        btnCaptureDesktop.style.display = 'inline-flex';
+      }
       
       // Wait for video to be ready, then start live detection
       video.onloadeddata = () => {
@@ -477,6 +523,17 @@ function setupEditorEvents(treasure, isNew) {
   }
   
   btnStartWebcam.addEventListener('click', () => startCamera(currentFacingMode));
+  
+  btnCameraClose.addEventListener('click', () => {
+    stopLiveDetection();
+    closeCameraModal();
+    if (webcamStream) {
+      webcamStream.getTracks().forEach(track => track.stop());
+      webcamStream = null;
+    }
+    btnStartWebcam.style.display = '';
+    btnCaptureDesktop.style.display = 'none';
+  });
   
   btnSwitchCamera.addEventListener('click', () => {
     const newMode = currentFacingMode === 'environment' ? 'user' : 'environment';
@@ -553,7 +610,14 @@ function setupEditorEvents(treasure, isNew) {
     // Clear canvas
     const ctx = liveDetectionCanvas.getContext('2d');
     ctx.clearRect(0, 0, liveDetectionCanvas.width, liveDetectionCanvas.height);
+    // Hide room info
+    document.getElementById('room-info-overlay').style.display = 'none';
   }
+  
+  const roomInfoOverlay = document.getElementById('room-info-overlay');
+  const roomIcon = document.getElementById('room-icon');
+  const roomName = document.getElementById('room-name');
+  const roomObjects = document.getElementById('room-objects');
   
   function drawLiveDetections(predictions) {
     const ctx = liveDetectionCanvas.getContext('2d');
@@ -576,7 +640,9 @@ function setupEditorEvents(treasure, isNew) {
     const scaleX = displayedWidth / videoWidth;
     const scaleY = displayedHeight / videoHeight;
     
-    predictions.filter(p => p.score > 0.5).forEach((pred, index) => {
+    const filtered = predictions.filter(p => p.score > 0.5);
+    
+    filtered.forEach((pred, index) => {
       const [x, y, width, height] = pred.bbox;
       
       const scaledX = x * scaleX;
@@ -600,9 +666,42 @@ function setupEditorEvents(treasure, isNew) {
       ctx.fillStyle = 'white';
       ctx.fillText(label, scaledX + 5, scaledY > 25 ? scaledY - 7 : scaledY + scaledHeight + 18);
     });
+    
+    // Update room info overlay
+    updateRoomInfo(predictions);
   }
   
-  btnCapture.addEventListener('click', async () => {
+  function updateRoomInfo(predictions) {
+    const room = inferRoom(predictions);
+    const filtered = predictions.filter(p => p.score > 0.5);
+    
+    if (filtered.length === 0) {
+      roomInfoOverlay.style.display = 'none';
+      return;
+    }
+    
+    roomInfoOverlay.style.display = 'block';
+    
+    if (room) {
+      roomIcon.textContent = room.icon;
+      roomName.textContent = room.name;
+    } else {
+      roomIcon.textContent = '📷';
+      roomName.textContent = '감지 중...';
+    }
+    
+    // Deduplicate and show object counts
+    const objCounts = {};
+    filtered.forEach(p => {
+      const name = translateClass(p.class);
+      objCounts[name] = (objCounts[name] || 0) + 1;
+    });
+    roomObjects.innerHTML = Object.entries(objCounts)
+      .map(([name, count]) => `<span class="room-obj-tag">${name}${count > 1 ? ' ×' + count : ''}</span>`)
+      .join('');
+  }
+  
+  async function performCapture() {
     // Stop live detection first
     stopLiveDetection();
     
@@ -617,9 +716,10 @@ function setupEditorEvents(treasure, isNew) {
     capturedImageData = canvas.toDataURL('image/jpeg', 0.8);
     capturedImage.src = capturedImageData;
     
-    document.getElementById('webcam-container').style.display = 'none';
+    // Close fullscreen modal and show results inline
+    closeCameraModal();
     capturedPreview.style.display = 'block';
-    btnCapture.style.display = 'none';
+    btnCaptureDesktop.style.display = 'none';
     btnRetake.style.display = 'inline-flex';
     
     // Stop webcam
@@ -649,7 +749,10 @@ function setupEditorEvents(treasure, isNew) {
     // Show detected objects list
     renderDetectedObjects(detectedObjects);
     detectedObjectsSection.style.display = 'block';
-  });
+  }
+  
+  btnCapture.addEventListener('click', performCapture);
+  btnCaptureDesktop.addEventListener('click', performCapture);
   
   function drawCapturedDetections(predictions, originalWidth, originalHeight) {
     const ctx = overlayCanvas.getContext('2d');
@@ -909,7 +1012,6 @@ function setupEditorEvents(treasure, isNew) {
     capturedPreview.style.display = 'none';
     detectedObjectsSection.style.display = 'none';
     selectedObjectInfo.style.display = 'none';
-    document.getElementById('webcam-container').style.display = '';
     btnRetake.style.display = 'none';
     
     await startCamera(currentFacingMode);
@@ -1171,6 +1273,88 @@ function translateClass(className) {
 }
 
 /**
+ * Infer room type from detected objects
+ */
+function inferRoom(predictions) {
+  const classes = predictions.filter(p => p.score > 0.4).map(p => p.class);
+  const has = (...items) => items.some(i => classes.includes(i));
+
+  const scores = {
+    kitchen:    0,
+    livingRoom: 0,
+    bedroom:    0,
+    bathroom:   0,
+    office:     0,
+    dining:     0,
+  };
+
+  // Kitchen signals
+  if (has('refrigerator'))  scores.kitchen += 3;
+  if (has('oven'))          scores.kitchen += 3;
+  if (has('microwave'))     scores.kitchen += 2;
+  if (has('toaster'))       scores.kitchen += 2;
+  if (has('sink'))          scores.kitchen += 1;
+  if (has('bottle'))        scores.kitchen += 1;
+  if (has('bowl', 'cup'))   scores.kitchen += 1;
+  if (has('knife', 'fork', 'spoon')) scores.kitchen += 1;
+
+  // Living room signals
+  if (has('couch'))         scores.livingRoom += 3;
+  if (has('tv'))            scores.livingRoom += 2;
+  if (has('remote'))        scores.livingRoom += 2;
+  if (has('potted plant'))  scores.livingRoom += 1;
+  if (has('vase'))          scores.livingRoom += 1;
+  if (has('clock'))         scores.livingRoom += 1;
+
+  // Bedroom signals
+  if (has('bed'))           scores.bedroom += 4;
+  if (has('teddy bear'))    scores.bedroom += 2;
+  if (has('clock'))         scores.bedroom += 1;
+  if (has('book'))          scores.bedroom += 1;
+
+  // Bathroom signals
+  if (has('toilet'))        scores.bathroom += 4;
+  if (has('sink'))          scores.bathroom += 2;
+  if (has('toothbrush'))    scores.bathroom += 3;
+  if (has('hair drier'))    scores.bathroom += 2;
+
+  // Office signals
+  if (has('laptop'))        scores.office += 3;
+  if (has('keyboard'))      scores.office += 2;
+  if (has('mouse'))         scores.office += 2;
+  if (has('cell phone'))    scores.office += 1;
+  if (has('book'))          scores.office += 1;
+  if (has('chair'))         scores.office += 1;
+
+  // Dining signals
+  if (has('dining table'))  scores.dining += 3;
+  if (has('chair'))         scores.dining += 1;
+  if (has('bowl', 'cup'))   scores.dining += 1;
+  if (has('wine glass'))    scores.dining += 2;
+  if (has('fork', 'knife', 'spoon')) scores.dining += 2;
+
+  const roomMap = {
+    kitchen:    { name: '주방',     icon: '🍳' },
+    livingRoom: { name: '거실',     icon: '🛋️' },
+    bedroom:    { name: '침실',     icon: '🛏️' },
+    bathroom:   { name: '욕실',     icon: '🚿' },
+    office:     { name: '서재/작업실', icon: '💻' },
+    dining:     { name: '식당',     icon: '🍽️' },
+  };
+
+  const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
+  if (best[1] >= 2) {
+    return roomMap[best[0]];
+  }
+  
+  // Fallback: if objects detected but no room match
+  if (classes.length > 0) {
+    return { name: '실내', icon: '🏠' };
+  }
+  return null;
+}
+
+/**
  * Get type badge text
  */
 function getTypeBadge(type) {
@@ -1330,6 +1514,92 @@ function addSetupStyles() {
       font-size: 0.85rem;
     }
     
+    /* Camera modal - inline by default */
+    .camera-modal {
+      position: relative;
+    }
+    
+    /* Fullscreen mode (mobile) */
+    .camera-modal.fullscreen {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: #000;
+      display: flex;
+      flex-direction: column;
+    }
+    
+    .camera-modal.fullscreen .camera-modal-inner {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+    
+    .camera-modal.fullscreen .webcam-container {
+      flex: 1;
+      border-radius: 0;
+      margin-bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .camera-modal.fullscreen .webcam-container video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    
+    .camera-modal-controls {
+      display: none;
+    }
+    
+    .camera-modal.fullscreen .camera-modal-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px;
+      padding-bottom: max(16px, env(safe-area-inset-bottom));
+      background: #000;
+    }
+    
+    .cam-modal-close {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(255,255,255,0.15);
+      color: white;
+      font-size: 1.2rem;
+      cursor: pointer;
+    }
+    
+    .cam-modal-capture {
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      border: 4px solid white;
+      background: rgba(255,255,255,0.2);
+      color: white;
+      font-size: 1.5rem;
+      cursor: pointer;
+      transition: transform 0.1s;
+    }
+    .cam-modal-capture:active {
+      transform: scale(0.9);
+      background: rgba(255,255,255,0.4);
+    }
+    
+    .cam-modal-spacer {
+      width: 44px;
+    }
+    
+    @media (pointer: coarse) {
+      .desktop-only-capture {
+        display: none !important;
+      }
+    }
+    
     .webcam-container {
       position: relative;
       width: 100%;
@@ -1382,6 +1652,40 @@ function addSetupStyles() {
       gap: 0.5rem;
       justify-content: center;
       flex-wrap: wrap;
+    }
+    
+    .room-info-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 8px 12px;
+      background: linear-gradient(180deg, rgba(0,0,0,0.6) 0%, rgba(0,0,0,0) 100%);
+      z-index: 5;
+      pointer-events: none;
+    }
+    
+    .room-info-room {
+      font-size: 1rem;
+      font-weight: 700;
+      color: white;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+      margin-bottom: 4px;
+    }
+    
+    .room-info-objects {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    
+    .room-obj-tag {
+      font-size: 0.7rem;
+      color: white;
+      background: rgba(99, 102, 241, 0.7);
+      padding: 1px 6px;
+      border-radius: 8px;
+      white-space: nowrap;
     }
     
     .cam-switch-btn {
