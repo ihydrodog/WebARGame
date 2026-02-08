@@ -12,7 +12,8 @@ import {
   FEATURE_SIMILARITY_THRESHOLD
 } from './utils/feature-embedding.js';
 import { loadDetectionModel, runDetection, isDetectionAvailable, pickDetectionAt } from './utils/detection.js';
-import { isSegmentAvailableForClass, getSegmentMasks, drawPredictionsWithSegments } from './utils/segment-helper.js';
+import { isSegmentAvailableForClass, getSegmentMasks } from './utils/segment-helper.js';
+import { DetectionOverlayView } from './utils/viewers.js';
 
 let container = null;
 let onBack = null;
@@ -24,6 +25,7 @@ let isGameActive = false;
 
 let arStream = null;
 let arDetectionRunning = false;
+let arOverlayView = null;
 
 /**
  * Initialize game
@@ -192,9 +194,13 @@ function showCurrentHint() {
 }
 
 /**
- * Stop AR mode (stop camera stream)
+ * Stop AR mode (stop camera stream and overlay)
  */
 function stopARMode() {
+  if (arOverlayView) {
+    arOverlayView.destroy();
+    arOverlayView = null;
+  }
   if (arStream) {
     arStream.getTracks().forEach(track => track.stop());
     arStream = null;
@@ -207,6 +213,10 @@ function stopARMode() {
 function startARMode() {
   const arContainer = document.getElementById('ar-container');
 
+  if (arOverlayView) {
+    arOverlayView.destroy();
+    arOverlayView = null;
+  }
   stopARMode();
 
   arContainer.innerHTML = `
@@ -226,12 +236,18 @@ function startARMode() {
   const detectionCanvas = document.getElementById('ar-detection-canvas');
   const touchLayer = document.getElementById('ar-touch-layer');
   const glass = document.getElementById('ar-magnifier-glass');
+  const arView = arContainer.querySelector('.ar-view');
   glass.style.display = 'none';
+
+  arOverlayView = new DetectionOverlayView(arView, detectionCanvas, {
+    fit: 'cover',
+    translateClass: getCocoLabel
+  });
 
   arDetectionRunning = true;
   let arModel = null;
   (async function detectionLoop() {
-    if (!arDetectionRunning || !video || !detectionCanvas) return;
+    if (!arDetectionRunning || !video || !arOverlayView) return;
     if (!isDetectionAvailable()) {
       setTimeout(detectionLoop, 200);
       return;
@@ -243,12 +259,6 @@ function startARMode() {
       }
       const vw = video.videoWidth;
       const vh = video.videoHeight;
-      const dw = video.clientWidth;
-      const dh = video.clientHeight;
-      if (!dw || !dh) {
-        setTimeout(detectionLoop, 100);
-        return;
-      }
       if (!arModel) arModel = await loadDetectionModel();
       const predictions = await runDetection(arModel, video, { scoreThreshold: 0.5 });
       let segmentMasks = [];
@@ -257,15 +267,8 @@ function startARMode() {
           segmentMasks = await getSegmentMasks(video);
         } catch (_) {}
       }
-      const ctx = detectionCanvas.getContext('2d');
-      detectionCanvas.width = dw;
-      detectionCanvas.height = dh;
-      ctx.clearRect(0, 0, dw, dh);
-      drawPredictionsWithSegments(ctx, predictions, segmentMasks, {
-        sourceWidth: vw,
-        sourceHeight: vh,
-        displayWidth: dw,
-        displayHeight: dh,
+      arOverlayView.setSourceSize(vw, vh);
+      arOverlayView.setContent(predictions, segmentMasks, {
         translateClass: getCocoLabel,
         scoreThreshold: 0.5,
         withIndex: false

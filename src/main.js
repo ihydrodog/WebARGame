@@ -14,6 +14,7 @@ import './components/ui/index.js';
 // Import game modules
 import { initSetup } from './setup.js';
 import { initGame } from './game.js';
+import { loadLevels, setActiveLevelId } from './data/default-treasures.js';
 
 /**
  * App Mode
@@ -86,11 +87,64 @@ export function switchMode(mode) {
       break;
     case 'play':
       app.innerHTML = '<div id="game-container"></div>';
-      initGame(document.getElementById('game-container'), () => switchMode('home'));
+      startPlay(document.getElementById('game-container'), () => switchMode('home'));
       break;
     default:
       renderHome();
   }
+}
+
+/**
+ * Start play: show level picker if 2+ levels, else go straight to game
+ * @param {HTMLElement} gameContainer
+ * @param {Function} backToHome
+ */
+function startPlay(gameContainer, backToHome) {
+  const { levels } = loadLevels();
+  const sorted = [...levels].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+  if (sorted.length === 0) {
+    gameContainer.innerHTML = `
+      <div class="no-treasures" style="padding: 2rem; text-align: center;">
+        <h2>보물이 없습니다</h2>
+        <p>게임 설정에서 레벨과 보물을 추가해주세요.</p>
+        <button class="btn btn-primary" id="btn-back">돌아가기</button>
+      </div>
+    `;
+    gameContainer.querySelector('#btn-back')?.addEventListener('click', backToHome);
+    return;
+  }
+
+  if (sorted.length === 1) {
+    setActiveLevelId(sorted[0].id);
+    initGame(gameContainer, backToHome);
+    return;
+  }
+
+  gameContainer.innerHTML = `
+    <div class="level-picker">
+      <h1>레벨 선택</h1>
+      <p class="hint-text">플레이할 레벨을 선택하세요.</p>
+      <div class="level-picker-list">
+        ${sorted.map((level) => `
+          <button class="level-picker-btn" data-level-id="${level.id}">
+            <span class="level-picker-name">${level.name || '레벨'}</span>
+            <span class="level-picker-meta">보물 ${(level.items || []).length}개</span>
+          </button>
+        `).join('')}
+      </div>
+      <button class="btn btn-secondary" id="btn-picker-back">돌아가기</button>
+    </div>
+  `;
+  gameContainer.querySelector('#btn-picker-back').addEventListener('click', backToHome);
+  gameContainer.querySelectorAll('.level-picker-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.levelId;
+      setActiveLevelId(id);
+      gameContainer.innerHTML = '';
+      initGame(gameContainer, backToHome);
+    });
+  });
 }
 
 // Start app when DOM is ready

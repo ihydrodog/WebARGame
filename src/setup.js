@@ -1,13 +1,26 @@
 /**
  * Setup Module
- * Handles treasure location setup with webcam capture and object detection
+ * Handles level list, level edit (treasure list + game settings), and treasure editor
  */
 
-import { loadTreasures, saveTreasures } from './data/default-treasures.js';
+import Sortable from 'sortablejs';
+import {
+  loadLevels,
+  saveLevels,
+  getLevel,
+  setActiveLevelId,
+  createLevel,
+  deleteLevel,
+  reorderLevels,
+  saveLevel,
+  loadTreasures,
+  saveTreasures
+} from './data/default-treasures.js';
 import { riddleBank, getRiddlesByCategory, getRiddlesByDifficulty } from './data/riddles/index.js';
 import { getEmbeddingFromCrop } from './utils/feature-embedding.js';
 import { loadDetectionModel, runDetection } from './utils/detection.js';
-import { getSegmentMasks, drawPredictionsWithSegments, isSegmentAvailableForClass } from './utils/segment-helper.js';
+import { getSegmentMasks, isSegmentAvailableForClass } from './utils/segment-helper.js';
+import { DetectionOverlayView, TreasureInfoViewer } from './utils/viewers.js';
 
 /**
  * Resolves when the video has valid dimensions and at least one frame has been painted (avoids first-frame no detection).
@@ -32,6 +45,8 @@ let container = null;
 let onBack = null;
 let treasures = [];
 let currentTreasureIndex = 0;
+/** When in level-edit screen, the level we're editing */
+let currentLevelId = null;
 
 /**
  * Initialize setup screen
@@ -41,11 +56,7 @@ let currentTreasureIndex = 0;
 export function initSetup(containerEl, backCallback) {
   container = containerEl;
   onBack = backCallback;
-  treasures = loadTreasures();
-  
-  renderSetupHome();
-  
-  // Preload object detection model so it's ready when user opens camera (silent, no overlay)
+  renderLevelList();
   loadObjectDetectionModel(true).catch(() => {});
 }
 
@@ -97,96 +108,164 @@ function hideLoadingOverlay() {
 }
 
 /**
- * Render setup home screen
+ * Render level list (1단계) — list UI with drag to reorder
  */
-function renderSetupHome() {
+function renderLevelList() {
+  currentLevelId = null;
+  const { levels } = loadLevels();
+  const sortedLevels = [...levels].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
   container.innerHTML = `
     <div class="setup-screen">
       <header class="setup-header">
         <button class="btn btn-secondary" id="btn-back">← 돌아가기</button>
-        <h1>게임 설정</h1>
+        <h1>레벨 목록</h1>
       </header>
-      
+      <div class="setup-content">
+        <section class="level-list card">
+          <h2>레벨</h2>
+          <p class="hint-text">레벨을 선택해 편집하거나, 새 레벨을 추가하세요.</p>
+          <div id="levels-container" class="level-list-container">
+            ${sortedLevels.length === 0 ? '<p class="empty-message">등록된 레벨이 없습니다.</p>' : ''}
+            ${sortedLevels.map((level, index) => `
+              <div class="level-item" data-level-id="${level.id}">
+                <span class="level-order">${index + 1}</span>
+                <div class="level-info">
+                  <span class="level-name">${level.name || `레벨 ${index + 1}`}</span>
+                  <span class="level-meta">보물 ${(level.items || []).length}개</span>
+                </div>
+                <div class="level-actions">
+                  <button class="btn btn-secondary btn-small btn-edit-level">편집</button>
+                  <button class="btn btn-danger btn-small btn-delete-level">삭제</button>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+          <button class="btn btn-primary" id="btn-add-level" style="width: 100%; margin-top: 1rem;">+ 레벨 추가</button>
+        </section>
+      </div>
+    </div>
+  `;
+
+  addSetupStyles();
+
+  document.getElementById('btn-back').addEventListener('click', onBack);
+  document.getElementById('btn-add-level').addEventListener('click', () => {
+    const level = createLevel('새 레벨');
+    renderLevelEdit(level.id);
+  });
+
+  sortedLevels.forEach((level) => {
+    const el = container.querySelector(`[data-level-id="${level.id}"]`);
+    if (!el) return;
+    el.querySelector('.btn-edit-level')?.addEventListener('click', () => renderLevelEdit(level.id));
+    el.querySelector('.btn-delete-level')?.addEventListener('click', () => {
+      if (confirm(`"${level.name || '이 레벨'}"을(를) 삭제하시겠습니까?`)) {
+        deleteLevel(level.id);
+        renderLevelList();
+      }
+    });
+  });
+
+  const levelsContainer = document.getElementById('levels-container');
+  if (levelsContainer && sortedLevels.length > 0) {
+    new Sortable(levelsContainer, {
+      animation: 150,
+      handle: '.level-item',
+      onEnd(evt) {
+        const ids = Array.from(levelsContainer.querySelectorAll('.level-item')).map((n) => n.dataset.levelId);
+        reorderLevels(ids);
+      }
+    });
+  }
+}
+
+/**
+ * Enter level edit (2단계): set current level and render level-edit screen
+ * @param {string} levelId
+ */
+function renderLevelEdit(levelId) {
+  currentLevelId = levelId;
+  setActiveLevelId(levelId);
+  treasures = loadTreasures();
+  renderLevelEditScreen();
+}
+
+/**
+ * Render level edit screen — treasure list (cards) + game settings
+ */
+function renderLevelEditScreen() {
+  const level = currentLevelId ? getLevel(currentLevelId) : null;
+  const levelName = level?.name || '레벨 편집';
+
+  container.innerHTML = `
+    <div class="setup-screen">
+      <header class="setup-header">
+        <button class="btn btn-secondary" id="btn-back-level">← 레벨 목록으로</button>
+        <h1>${levelName}</h1>
+      </header>
       <div class="setup-content">
         <section class="treasure-list card">
           <h2>보물 목록</h2>
           <p class="hint-text">보물을 추가하여 게임을 만들어보세요!</p>
-          
-          <div id="treasures-container">
-            ${renderTreasureList()}
+          <div id="treasures-container" class="treasure-cards-container">
+            ${TreasureInfoViewer.renderList(treasures.items)}
           </div>
-          
-          <button class="btn btn-primary" id="btn-add-treasure" style="width: 100%; margin-top: 1rem;">
-            + 보물 추가
-          </button>
+          <button class="btn btn-primary" id="btn-add-treasure" style="width: 100%; margin-top: 1rem;">+ 보물 추가</button>
         </section>
-        
         <section class="game-settings card" style="margin-top: 1rem;">
           <h2>게임 설정</h2>
-          
           <div class="form-group">
             <label class="form-label">시작 점수</label>
             <input type="number" class="form-input" id="initial-score" 
                    value="${treasures.initialScore || 1000}" min="100" step="100">
           </div>
-          
           <div class="form-group">
             <label class="form-label">초당 차감 점수</label>
             <input type="number" class="form-input" id="score-decay" 
                    value="${treasures.scoreDecayPerSecond || 1}" min="0" step="0.5">
           </div>
-          
-          <button class="btn btn-success" id="btn-save-settings" style="width: 100%; margin-top: 1rem;">
-            설정 저장
-          </button>
+          <button class="btn btn-success" id="btn-save-settings" style="width: 100%; margin-top: 1rem;">설정 저장</button>
         </section>
       </div>
     </div>
   `;
-  
+
   addSetupStyles();
-  
-  document.getElementById('btn-back').addEventListener('click', onBack);
+
+  document.getElementById('btn-back-level').addEventListener('click', () => renderLevelList());
   document.getElementById('btn-add-treasure').addEventListener('click', () => {
     currentTreasureIndex = treasures.items ? treasures.items.length : 0;
     renderTreasureEditor(null);
   });
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
-  
-  document.querySelectorAll('.treasure-item').forEach((item, index) => {
-    item.querySelector('.btn-edit')?.addEventListener('click', () => {
+
+  document.querySelectorAll('.treasure-card').forEach((card, index) => {
+    const item = treasures.items?.[index];
+    if (!item) return;
+    card.querySelector('.btn-edit')?.addEventListener('click', () => {
       currentTreasureIndex = index;
       renderTreasureEditor(treasures.items[index]);
     });
-    item.querySelector('.btn-delete')?.addEventListener('click', () => {
-      deleteTreasure(index);
-    });
+    card.querySelector('.btn-delete')?.addEventListener('click', () => deleteTreasure(index));
   });
-}
 
-/**
- * Render treasure list HTML
- */
-function renderTreasureList() {
-  if (!treasures.items || treasures.items.length === 0) {
-    return '<p class="empty-message">등록된 보물이 없습니다.</p>';
+  const treasuresContainer = document.getElementById('treasures-container');
+  if (treasuresContainer && treasures.items?.length > 0) {
+    new Sortable(treasuresContainer, {
+      animation: 150,
+      handle: '.treasure-card',
+      onEnd(evt) {
+        if (evt.oldIndex == null || evt.newIndex == null) return;
+        const items = [...treasures.items];
+        const [moved] = items.splice(evt.oldIndex, 1);
+        items.splice(evt.newIndex, 0, moved);
+        treasures.items = items.map((t, i) => ({ ...t, order: i + 1 }));
+        saveTreasures(treasures);
+        renderLevelEditScreen();
+      }
+    });
   }
-  
-  return treasures.items.map((treasure, index) => `
-    <div class="treasure-item" data-index="${index}">
-      <div class="treasure-info">
-        <span class="treasure-order">${index + 1}</span>
-        <div class="treasure-details">
-          <span class="treasure-name">${treasure.name || `보물 ${index + 1}`}</span>
-          ${treasure.detectedObject ? `<span class="treasure-object">🎯 ${treasure.detectedObject}</span>` : ''}
-        </div>
-      </div>
-      <div class="treasure-actions">
-        <button class="btn btn-secondary btn-small btn-edit">수정</button>
-        <button class="btn btn-danger btn-small btn-delete">삭제</button>
-      </div>
-    </div>
-  `).join('');
 }
 
 /**
@@ -216,22 +295,23 @@ function renderTreasureEditor(treasure) {
           <h2>기본 정보</h2>
           <div class="form-group">
             <label class="form-label">보물 이름</label>
-            <input type="text" class="form-input" id="treasure-name" 
-                   value="${treasure.name || ''}" placeholder="예: 냉장고 안 보물">
+            <input type="text" class="form-input" id="treasure-name" readonly
+                   value="${treasure.name || ''}" placeholder="아래에서 보물 대상을 선택하면 자동으로 입력됩니다">
           </div>
         </section>
         
-        <!-- Webcam Capture with Object Detection -->
+        <!-- 촬영 & 오브젝트 선택 -->
         <section class="card" style="margin-top: 1rem;">
-          <h2>위치 촬영 (웹캠) + AI 오브젝트 검출</h2>
-          <p class="hint-text">촬영 후 AI가 오브젝트를 검출합니다. 원하는 오브젝트를 선택하세요!</p>
+          <h2>촬영 & 보물 대상 선택</h2>
+          <p class="hint-text">촬영 후 표시된 오브젝트 중 하나를 선택하세요.</p>
           
-          <!-- Fullscreen camera modal (mobile) / inline (desktop) -->
+          <!-- Fullscreen camera modal (mobile) / inline (desktop). 캡처 결과도 같은 공간에 표시 -->
           <div id="camera-fullscreen-modal" class="camera-modal">
             <div class="camera-modal-inner">
               <div class="webcam-container" id="webcam-container">
-                <video id="webcam-preview" autoplay playsinline></video>
-                <canvas id="live-detection-canvas"></canvas>
+                <video id="webcam-preview" autoplay playsinline class="preview-source"></video>
+                <img id="captured-image" alt="캡처" class="preview-source" style="display: none;">
+                <canvas id="detection-overlay" class="detection-overlay"></canvas>
                 <canvas id="capture-canvas" style="display: none;"></canvas>
                 <canvas id="detection-canvas" style="display: none;"></canvas>
                 <div id="room-info-overlay" class="room-info-overlay" style="display: none;">
@@ -240,47 +320,28 @@ function renderTreasureEditor(treasure) {
                 </div>
                 <button class="cam-switch-btn" id="btn-switch-camera" style="display: none;" title="카메라 전환">🔄</button>
                 <span id="zoom-level" class="cam-zoom-badge" style="display: none;">1.0x</span>
+                <button type="button" class="captured-view-close" id="btn-captured-close" style="display: none;" title="다시 찍기">✕</button>
               </div>
               <div class="camera-modal-controls">
                 <button class="cam-modal-close" id="btn-camera-close" title="닫기">✕</button>
-                <button class="cam-modal-capture" id="btn-capture">📷</button>
+                <button class="cam-modal-capture" id="btn-capture" title="촬영">📷</button>
                 <div class="cam-modal-spacer"></div>
               </div>
             </div>
           </div>
           
-          <div id="captured-preview" style="display: none;">
-            <div class="detection-image-container">
-              <img id="captured-image" alt="캡처된 이미지">
-              <canvas id="overlay-canvas"></canvas>
-            </div>
-          </div>
-          
-          <!-- Detected Objects -->
           <div id="detected-objects" style="display: none;">
-            <label class="form-label">검출된 오브젝트 (클릭하여 선택)</label>
+            <p class="detected-objects-label">오브젝트 선택 <span id="selected-object-name" class="selected-name-inline"></span></p>
             <div id="objects-list" class="objects-grid"></div>
-          </div>
-          
-          <!-- Selected Object -->
-          <div id="selected-object-info" style="display: none;">
-            <div class="selected-object-badge">
-              <span>🎯 선택됨:</span>
-              <strong id="selected-object-name"></strong>
-              <button class="btn btn-small btn-secondary" id="btn-clear-selection">취소</button>
-            </div>
-            <div class="form-group" style="margin-top: 0.5rem;">
-              <label class="form-label checkbox-label">
-                <input type="checkbox" id="feature-limit-checkbox" ${(isNew || treasure.featureEmbedding?.length) ? 'checked' : ''}>
-                <span>대상 한정 – 같은 종류 중 선택한 대상만 인정 (피처 비교)</span>
-              </label>
-            </div>
+            <label class="form-label checkbox-label checkbox-inline">
+              <input type="checkbox" id="feature-limit-checkbox" ${(isNew || treasure.featureEmbedding?.length) ? 'checked' : ''}>
+              <span>같은 종류 중 선택한 대상만 인정</span>
+            </label>
           </div>
           
           <div class="webcam-controls">
             <button class="btn btn-primary" id="btn-start-webcam">카메라 시작</button>
-            <button class="btn btn-success desktop-only-capture" id="btn-capture-desktop" style="display: none;">📷 촬영 + AI 검출</button>
-            <button class="btn btn-secondary" id="btn-retake" style="display: none;">다시 찍기</button>
+            <button class="btn btn-success desktop-only-capture" id="btn-capture-desktop" style="display: none;">📷 촬영</button>
           </div>
         </section>
         
@@ -349,34 +410,6 @@ function renderTreasureEditor(treasure) {
           </div>
         </section>
         
-        <!-- Hint -->
-        <section class="card" style="margin-top: 1rem;">
-          <h2>다음 보물 힌트</h2>
-          
-          <div class="form-group">
-            <label class="form-label">힌트 유형</label>
-            <select class="form-input" id="hint-type">
-              <option value="text" ${treasure.hint?.type === 'text' ? 'selected' : ''}>텍스트</option>
-              <option value="image" ${treasure.hint?.type === 'image' ? 'selected' : ''}>이미지</option>
-            </select>
-          </div>
-          
-          <div id="hint-text-section" style="${treasure.hint?.type === 'text' || !treasure.hint?.type ? '' : 'display: none;'}">
-            <div class="form-group">
-              <label class="form-label">힌트 문구</label>
-              <textarea class="form-input" id="hint-text" rows="3" 
-                        placeholder="다음 보물 위치에 대한 힌트를 입력하세요">${treasure.hint?.config?.value || ''}</textarea>
-            </div>
-          </div>
-          
-          <div id="hint-image-section" style="${treasure.hint?.type === 'image' ? '' : 'display: none;'}">
-            <div class="form-group">
-              <label class="form-label">힌트 이미지</label>
-              <input type="file" class="form-input" id="hint-image-file" accept="image/*">
-            </div>
-          </div>
-        </section>
-        
         <!-- Save Button -->
         <button class="btn btn-success btn-large" id="btn-save-treasure" style="width: 100%; margin-top: 1rem;">
           ${isNew ? '보물 추가' : '저장'}
@@ -409,32 +442,22 @@ function setupEditorEvents(treasure, isNew) {
     if (webcamStream) {
       webcamStream.getTracks().forEach(track => track.stop());
     }
-    renderSetupHome();
+    renderLevelEditScreen();
   });
   
   // Webcam controls
   const video = document.getElementById('webcam-preview');
   const canvas = document.getElementById('capture-canvas');
-  const overlayCanvas = document.getElementById('overlay-canvas');
-  const liveDetectionCanvas = document.getElementById('live-detection-canvas');
-  const capturedPreview = document.getElementById('captured-preview');
   const capturedImage = document.getElementById('captured-image');
+  const detectionOverlay = document.getElementById('detection-overlay');
   const btnStartWebcam = document.getElementById('btn-start-webcam');
   const btnCapture = document.getElementById('btn-capture');
   const btnCaptureDesktop = document.getElementById('btn-capture-desktop');
-  const btnRetake = document.getElementById('btn-retake');
+  const btnCapturedClose = document.getElementById('btn-captured-close');
   const detectedObjectsSection = document.getElementById('detected-objects');
   const objectsList = document.getElementById('objects-list');
-  const selectedObjectInfo = document.getElementById('selected-object-info');
   const selectedObjectName = document.getElementById('selected-object-name');
   const featureLimitCheckbox = document.getElementById('feature-limit-checkbox');
-  const featureLabelWrap = document.getElementById('feature-label-wrap');
-
-  function updateFeatureLabelWrapVisibility() {
-    if (featureLabelWrap) featureLabelWrap.style.display = featureLimitCheckbox?.checked ? 'block' : 'none';
-  }
-  updateFeatureLabelWrapVisibility();
-  featureLimitCheckbox?.addEventListener('change', updateFeatureLabelWrapVisibility);
 
   let liveDetectionRunning = false;
   let liveDetectionModel = null;
@@ -449,6 +472,8 @@ function setupEditorEvents(treasure, isNew) {
   const cameraModal = document.getElementById('camera-fullscreen-modal');
   const btnCameraClose = document.getElementById('btn-camera-close');
   const isMobile = /Android|iPhone|iPod|Windows Phone/i.test(navigator.userAgent);
+
+  const detectionOverlayView = new DetectionOverlayView(webcamContainer, detectionOverlay, { translateClass });
   
   function openCameraModal() {
     if (isMobile) {
@@ -553,6 +578,7 @@ function setupEditorEvents(treasure, isNew) {
       webcamStream.getTracks().forEach(track => track.stop());
       webcamStream = null;
     }
+    switchToLiveView();
     btnStartWebcam.style.display = '';
     btnCaptureDesktop.style.display = 'none';
   });
@@ -635,37 +661,24 @@ function setupEditorEvents(treasure, isNew) {
   
   function stopLiveDetection() {
     liveDetectionRunning = false;
-    // Clear canvas
-    const ctx = liveDetectionCanvas.getContext('2d');
-    ctx.clearRect(0, 0, liveDetectionCanvas.width, liveDetectionCanvas.height);
-    // Hide room info
+    detectionOverlayView.clear();
     document.getElementById('room-info-overlay').style.display = 'none';
   }
-  
+
   const roomInfoOverlay = document.getElementById('room-info-overlay');
   const roomIcon = document.getElementById('room-icon');
   const roomName = document.getElementById('room-name');
   const roomObjects = document.getElementById('room-objects');
-  
+
   function drawLiveDetections(predictions, segmentMasks = []) {
     const videoWidth = video.videoWidth;
     const videoHeight = video.videoHeight;
-    const displayedWidth = video.clientWidth;
-    const displayedHeight = video.clientHeight;
-    if (!videoWidth || !videoHeight || !displayedWidth || !displayedHeight) {
+    if (!videoWidth || !videoHeight) {
       updateRoomInfo(predictions);
       return;
     }
-    const ctx = liveDetectionCanvas.getContext('2d');
-    liveDetectionCanvas.width = displayedWidth;
-    liveDetectionCanvas.height = displayedHeight;
-    ctx.clearRect(0, 0, displayedWidth, displayedHeight);
-    drawPredictionsWithSegments(ctx, predictions, segmentMasks, {
-      sourceWidth: videoWidth,
-      sourceHeight: videoHeight,
-      displayWidth: displayedWidth,
-      displayHeight: displayedHeight,
-      translateClass,
+    detectionOverlayView.setSourceSize(videoWidth, videoHeight);
+    detectionOverlayView.setContent(predictions, segmentMasks, {
       scoreThreshold: 0.5,
       withIndex: false
     });
@@ -718,13 +731,12 @@ function setupEditorEvents(treasure, isNew) {
     canvas.getContext('2d').drawImage(video, 0, 0);
     capturedImageData = canvas.toDataURL('image/jpeg', 0.8);
     capturedImage.src = capturedImageData;
-    
-    // Close fullscreen modal and show results inline
-    closeCameraModal();
-    capturedPreview.style.display = 'block';
+    video.style.display = 'none';
+    capturedImage.style.display = 'block';
+    if (btnCapture) btnCapture.style.display = 'none';
+    if (btnCapturedClose) btnCapturedClose.style.display = 'block';
     btnCaptureDesktop.style.display = 'none';
-    btnRetake.style.display = 'inline-flex';
-    
+
     // Stop webcam
     if (webcamStream) {
       webcamStream.getTracks().forEach(track => track.stop());
@@ -779,36 +791,25 @@ function setupEditorEvents(treasure, isNew) {
   
   btnCapture.addEventListener('click', performCapture);
   btnCaptureDesktop.addEventListener('click', performCapture);
-  
-  function drawCapturedDetections(predictions, originalWidth, originalHeight, segmentMasks = []) {
-    const displayedWidth = capturedImage.clientWidth;
-    const displayedHeight = capturedImage.clientHeight;
-    if (!displayedWidth || !displayedHeight || !originalWidth || !originalHeight) return;
-    const ctx = overlayCanvas.getContext('2d');
-    overlayCanvas.width = displayedWidth;
-    overlayCanvas.height = displayedHeight;
-    ctx.clearRect(0, 0, displayedWidth, displayedHeight);
 
-    drawPredictionsWithSegments(ctx, predictions, segmentMasks, {
-      sourceWidth: originalWidth,
-      sourceHeight: originalHeight,
-      displayWidth: displayedWidth,
-      displayHeight: displayedHeight,
-      translateClass,
+  function getStyleForPred(pred) {
+    const isSelected = selectedObject === pred.class;
+    return {
+      fillStyle: isSelected ? 'rgba(16, 185, 129, 0.25)' : 'rgba(99, 102, 241, 0.2)',
+      strokeStyle: isSelected ? '#10b981' : '#6366f1',
+      lineWidth: isSelected ? 4 : 3
+    };
+  }
+
+  function drawCapturedDetections(predictions, originalWidth, originalHeight, segmentMasks = []) {
+    detectionOverlayView.setSourceSize(originalWidth, originalHeight);
+    detectionOverlayView.setContent(predictions, segmentMasks, {
       scoreThreshold: 0,
-      withIndex: true,
-      getStyle: (pred) => {
-        const isSelected = selectedObject === pred.class;
-        return {
-          fillStyle: isSelected ? 'rgba(16, 185, 129, 0.25)' : 'rgba(99, 102, 241, 0.2)',
-          strokeStyle: isSelected ? '#10b981' : '#6366f1',
-          lineWidth: isSelected ? 4 : 3
-        };
-      }
+      getStyle: getStyleForPred
     });
   }
   
-  async function detectObjects(imageElement, overlayCanvas) {
+  async function detectObjects(imageElement) {
     showLoadingOverlay('AI 오브젝트 검출 중...');
     
     const model = await loadObjectDetectionModel();
@@ -846,7 +847,7 @@ function setupEditorEvents(treasure, isNew) {
       } else {
         lastSegmentMasksForCaptured = [];
       }
-      drawDetections(overlayCanvas, detectedObjects);
+      drawDetections(detectionOverlay, detectedObjects);
       
       // Show detected objects list
       renderDetectedObjects(detectedObjects);
@@ -859,31 +860,14 @@ function setupEditorEvents(treasure, isNew) {
     }
   }
   
-  function drawDetections(canvas, predictions) {
-    const ctx = canvas.getContext('2d');
-    const naturalWidth = capturedImage.naturalWidth;
-    const naturalHeight = capturedImage.naturalHeight;
-    const displayedWidth = capturedImage.clientWidth;
-    const displayedHeight = capturedImage.clientHeight;
-    canvas.width = displayedWidth;
-    canvas.height = displayedHeight;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    drawPredictionsWithSegments(ctx, predictions, lastSegmentMasksForCaptured || [], {
-      sourceWidth: naturalWidth,
-      sourceHeight: naturalHeight,
-      displayWidth: displayedWidth,
-      displayHeight: displayedHeight,
-      translateClass,
+  function drawDetections(_canvas, predictions) {
+    const nw = capturedImage.naturalWidth;
+    const nh = capturedImage.naturalHeight;
+    if (!nw || !nh) return;
+    detectionOverlayView.setSourceSize(nw, nh);
+    detectionOverlayView.setContent(predictions, lastSegmentMasksForCaptured || [], {
       scoreThreshold: 0,
-      withIndex: true,
-      getStyle: (pred) => {
-        const isSelected = selectedObject === pred.class;
-        return {
-          fillStyle: isSelected ? 'rgba(16, 185, 129, 0.25)' : 'rgba(99, 102, 241, 0.2)',
-          strokeStyle: isSelected ? '#10b981' : '#6366f1',
-          lineWidth: isSelected ? 4 : 2
-        };
-      }
+      getStyle: (pred) => ({ ...getStyleForPred(pred), lineWidth: selectedObject === pred.class ? 4 : 2 })
     });
   }
   
@@ -911,37 +895,28 @@ function setupEditorEvents(treasure, isNew) {
     selectedObject = objectClass;
     selectedDetectionIndex = index;
     
-    // Update UI
     objectsList.querySelectorAll('.object-card').forEach(card => {
       const match = card.dataset.class === objectClass && parseInt(card.dataset.index, 10) === index;
       card.classList.toggle('selected', match);
     });
     
-    // Show selected info
-    selectedObjectInfo.style.display = 'flex';
-    selectedObjectName.textContent = translateClass(objectClass);
+    if (selectedObjectName) selectedObjectName.textContent = ` · 선택: ${translateClass(objectClass)}`;
     
-    // Redraw detections with selection highlight
-    drawDetections(overlayCanvas, detectedObjects);
+    drawDetections(detectionOverlay, detectedObjects);
     
-    // Auto-fill treasure name if empty
     const nameInput = document.getElementById('treasure-name');
-    if (!nameInput.value) {
-      nameInput.value = `${translateClass(objectClass)} 보물`;
-    }
+    if (nameInput) nameInput.value = translateClass(objectClass);
   }
   
-  document.getElementById('btn-clear-selection')?.addEventListener('click', () => {
-    selectedObject = null;
-    selectedDetectionIndex = null;
-    selectedObjectInfo.style.display = 'none';
-    objectsList.querySelectorAll('.object-card').forEach(card => {
-      card.classList.remove('selected');
-    });
-    drawDetections(overlayCanvas, detectedObjects);
-  });
-  
-  btnRetake.addEventListener('click', async () => {
+  function switchToLiveView() {
+    if (video) video.style.display = '';
+    if (capturedImage) capturedImage.style.display = 'none';
+    if (btnCapture) btnCapture.style.display = '';
+    if (btnCapturedClose) btnCapturedClose.style.display = 'none';
+    btnCaptureDesktop.style.display = 'inline-flex';
+  }
+
+  async function handleRetake() {
     capturedImageData = null;
     selectedObject = null;
     selectedDetectionIndex = null;
@@ -949,14 +924,66 @@ function setupEditorEvents(treasure, isNew) {
     captureHeight = 0;
     detectedObjects = [];
     lastLivePredictions = [];
-    capturedPreview.style.display = 'none';
+    switchToLiveView();
     detectedObjectsSection.style.display = 'none';
-    selectedObjectInfo.style.display = 'none';
-    btnRetake.style.display = 'none';
-    
+    if (selectedObjectName) selectedObjectName.textContent = '';
     await startCamera(currentFacingMode);
-  });
-  
+  }
+
+  btnCapturedClose?.addEventListener('click', handleRetake);
+
+  /** 보물 수정 시: 저장된 캡처 이미지와 선택 오브젝트를 표시 */
+  async function restoreExistingCapture() {
+    if (!capturedImageData) return;
+    video.style.display = 'none';
+    capturedImage.style.display = 'block';
+    capturedImage.src = capturedImageData;
+    if (btnCapture) btnCapture.style.display = 'none';
+    if (btnCapturedClose) btnCapturedClose.style.display = 'block';
+    btnStartWebcam.style.display = 'none';
+    btnCaptureDesktop.style.display = 'none';
+
+    await new Promise((resolve) => {
+      if (capturedImage.complete) resolve();
+      else capturedImage.onload = resolve;
+    });
+    captureWidth = capturedImage.naturalWidth;
+    captureHeight = capturedImage.naturalHeight;
+
+    const model = await loadObjectDetectionModel();
+    if (!model) return;
+    const predictions = await runDetection(model, capturedImage, { scoreThreshold: 0.3 });
+    detectedObjects = predictions;
+    if (detectedObjects.length === 0) return;
+
+    if (selectedObject) {
+      const idx = detectedObjects.findIndex((p) => p.class === selectedObject);
+      if (idx >= 0) selectedDetectionIndex = idx;
+    }
+    if (isSegmentAvailableForClass('person')) {
+      try {
+        lastSegmentMasksForCaptured = await getSegmentMasks(capturedImage);
+      } catch (_) {
+        lastSegmentMasksForCaptured = [];
+      }
+    } else {
+      lastSegmentMasksForCaptured = [];
+    }
+
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    detectionOverlayView.setSourceSize(captureWidth, captureHeight);
+    detectionOverlayView.setContent(detectedObjects, lastSegmentMasksForCaptured, {
+      scoreThreshold: 0,
+      getStyle: getStyleForPred
+    });
+    detectedObjectsSection.style.display = 'block';
+    renderDetectedObjects(detectedObjects);
+    if (selectedObjectName && selectedObject) {
+      selectedObjectName.textContent = ` · 선택: ${translateClass(selectedObject)}`;
+    }
+  }
+  restoreExistingCapture().catch(() => {});
+
   // Riddle mode toggle
   const riddleMode = document.getElementById('riddle-mode');
   const bankSection = document.getElementById('riddle-bank-section');
@@ -1030,21 +1057,6 @@ function setupEditorEvents(treasure, isNew) {
   riddleMode.addEventListener('change', updateRiddleModeUI);
   updateRiddleModeUI();
   
-  // Hint type toggle
-  const hintType = document.getElementById('hint-type');
-  const hintTextSection = document.getElementById('hint-text-section');
-  const hintImageSection = document.getElementById('hint-image-section');
-  
-  hintType.addEventListener('change', () => {
-    if (hintType.value === 'text') {
-      hintTextSection.style.display = 'block';
-      hintImageSection.style.display = 'none';
-    } else {
-      hintTextSection.style.display = 'none';
-      hintImageSection.style.display = 'block';
-    }
-  });
-  
   // Save treasure
   document.getElementById('btn-save-treasure').addEventListener('click', async () => {
     const name = document.getElementById('treasure-name').value.trim();
@@ -1080,14 +1092,10 @@ function setupEditorEvents(treasure, isNew) {
       };
     }
     
-    // Build hint
-    const hintTypeValue = hintType.value;
-    let hint = { type: hintTypeValue, config: {} };
-    
-    if (hintTypeValue === 'text') {
-      hint.config.value = document.getElementById('hint-text').value.trim();
-    }
-    
+    // Hint = 다음 보물 이름으로 자동 설정
+    const nextName = treasures.items?.[currentTreasureIndex + 1]?.name ?? '';
+    const hint = { type: 'text', config: { value: nextName } };
+
     const featureLimitEnabled = document.getElementById('feature-limit-checkbox')?.checked ?? true;
 
     const newTreasure = {
@@ -1150,7 +1158,7 @@ function setupEditorEvents(treasure, isNew) {
     if (webcamStream) {
       webcamStream.getTracks().forEach(track => track.stop());
     }
-    renderSetupHome();
+    renderLevelEditScreen();
   });
 }
 
@@ -1369,7 +1377,7 @@ function deleteTreasure(index) {
     treasures.items.splice(index, 1);
     treasures.items.forEach((t, i) => t.order = i + 1);
     saveTreasures(treasures);
-    renderSetupHome();
+    renderLevelEditScreen();
   }
 }
 
@@ -1477,36 +1485,17 @@ function addSetupStyles() {
       padding: 2rem;
     }
     
-    .treasure-item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 0.75rem;
-      border-bottom: 1px solid #e2e8f0;
-    }
-    
-    .treasure-item:last-child {
-      border-bottom: none;
-    }
-    
-    .treasure-info {
+    .level-list-container { min-height: 2rem; }
+    .level-item {
       display: flex;
       align-items: center;
       gap: 0.75rem;
+      padding: 0.75rem;
+      border-bottom: 1px solid #e2e8f0;
+      cursor: grab;
     }
-    
-    .treasure-details {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-    }
-    
-    .treasure-object {
-      font-size: 0.75rem;
-      color: var(--success-color);
-    }
-    
-    .treasure-order {
+    .level-item:last-child { border-bottom: none; }
+    .level-order {
       width: 28px;
       height: 28px;
       background: var(--primary-color);
@@ -1519,11 +1508,62 @@ function addSetupStyles() {
       font-size: 0.9rem;
       flex-shrink: 0;
     }
+    .level-info { display: flex; flex-direction: column; gap: 0.25rem; flex: 1; }
+    .level-name { font-weight: 500; }
+    .level-meta { font-size: 0.8rem; color: var(--text-light); }
+    .level-actions { display: flex; gap: 0.5rem; }
     
-    .treasure-actions {
-      display: flex;
-      gap: 0.5rem;
+    .treasure-cards-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 0.75rem;
     }
+    .treasure-card {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: var(--border-radius, 8px);
+      padding: 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      cursor: grab;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .treasure-card:hover { border-color: var(--primary-color); }
+    .treasure-card-body { display: flex; flex-direction: column; gap: 0.5rem; }
+    .treasure-card-thumb {
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      border-radius: 6px;
+      background: #e2e8f0;
+    }
+    .treasure-card-thumb.placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2rem;
+    }
+    .treasure-card-info {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .treasure-card-info .treasure-order {
+      width: 22px;
+      height: 22px;
+      background: var(--primary-color);
+      color: white;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      font-size: 0.8rem;
+    }
+    .treasure-card-info .treasure-name { font-weight: 500; font-size: 0.9rem; }
+    .treasure-object { font-size: 0.75rem; color: var(--success-color); }
+    .treasure-card-actions { display: flex; gap: 0.5rem; margin-top: auto; }
     
     .btn-small {
       padding: 0.4rem 0.8rem;
@@ -1619,48 +1659,48 @@ function addSetupStyles() {
     .webcam-container {
       position: relative;
       width: 100%;
+      min-height: 240px;
+      aspect-ratio: 4/3;
       background: #000;
       border-radius: var(--border-radius);
       overflow: hidden;
       margin-bottom: 1rem;
     }
     
-    .webcam-container video {
-      width: 100%;
-      display: block;
-    }
-    
-    .webcam-container #live-detection-canvas {
+    .captured-view-close {
       position: absolute;
-      top: 0;
-      left: 0;
+      top: 0.5rem;
+      right: 0.5rem;
+      z-index: 10;
+      width: 40px;
+      height: 40px;
+      border: none;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      font-size: 1.25rem;
+      line-height: 1;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .captured-view-close:hover {
+      background: rgba(0, 0, 0, 0.7);
+    }
+    .webcam-container .preview-source {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .webcam-container .detection-overlay {
+      position: absolute;
+      inset: 0;
       width: 100%;
       height: 100%;
       pointer-events: none;
-    }
-    
-    #captured-preview {
-      margin-bottom: 1rem;
-    }
-    
-    .detection-image-container {
-      position: relative;
-      width: 100%;
-      border-radius: var(--border-radius);
-      overflow: hidden;
-    }
-    
-    .detection-image-container img {
-      width: 100%;
-      display: block;
-    }
-    
-    .detection-image-container canvas {
-      position: absolute;
-      top: 0;
-      left: 0;
-      pointer-events: none;
-      /* Canvas size is set dynamically in JS to match displayed image */
     }
     
     .webcam-controls {
@@ -1808,19 +1848,24 @@ function addSetupStyles() {
       color: var(--text-light);
     }
     
-    .selected-object-badge {
+    .detected-objects-label {
+      font-size: 0.9rem;
+      font-weight: 500;
+      margin-bottom: 0.5rem;
+    }
+    .selected-name-inline {
+      color: var(--success-color);
+      font-weight: 600;
+    }
+    .checkbox-inline {
       display: flex;
       align-items: center;
       gap: 0.5rem;
-      padding: 0.75rem 1rem;
-      background: #d1fae5;
-      border-radius: var(--border-radius);
-      margin-top: 0.5rem;
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+      color: var(--text-light);
     }
-    
-    .selected-object-badge span:first-child {
-      color: var(--success-color);
-    }
+    .checkbox-inline input { flex-shrink: 0; }
     
     /* Riddle Cards */
     .riddle-filters {
