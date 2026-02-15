@@ -21,6 +21,10 @@ import { getEmbeddingFromCrop } from './utils/feature-embedding.js';
 import { loadDetectionModel, runDetection } from './utils/detection.js';
 import { getSegmentMasks, isSegmentAvailableForClass } from './utils/segment-helper.js';
 import { DetectionOverlayView, TreasureInfoViewer } from './utils/viewers.js';
+import { CaptureEditModel } from './utils/capture-edit-model.js';
+import { CaptureEditView } from './utils/capture-edit-view.js';
+import { MediaDetectionView } from './utils/media-detection-view.js';
+import { cameraDetectionStore } from './stores/camera-detection.js';
 
 /**
  * Resolves when the video has valid dimensions and at least one frame has been painted (avoids first-frame no detection).
@@ -309,9 +313,7 @@ function renderTreasureEditor(treasure) {
           <div id="camera-fullscreen-modal" class="camera-modal">
             <div class="camera-modal-inner">
               <div class="webcam-container" id="webcam-container">
-                <video id="webcam-preview" autoplay playsinline class="preview-source"></video>
-                <img id="captured-image" alt="캡처" class="preview-source" style="display: none;">
-                <canvas id="detection-overlay" class="detection-overlay"></canvas>
+                <div id="media-detection-mount" class="media-detection-view-container"></div>
                 <canvas id="capture-canvas" style="display: none;"></canvas>
                 <canvas id="detection-canvas" style="display: none;"></canvas>
                 <div id="room-info-overlay" class="room-info-overlay" style="display: none;">
@@ -426,30 +428,19 @@ function renderTreasureEditor(treasure) {
  * Setup editor event listeners
  */
 function setupEditorEvents(treasure, isNew) {
-  let webcamStream = null;
-  let capturedImageData = treasure.capturedImage || null;
-  let detectedObjects = [];
-  let selectedObject = treasure.detectedObject || null;
-  let selectedDetectionIndex = null; // which detection (e.g. which person) when multiple same class
-  let captureWidth = 0;
-  let captureHeight = 0;
-  let lastSegmentMasksForCaptured = []; // segment masks for captured image (UI 그리기용)
+  const store = cameraDetectionStore.getState();
   let selectedRiddleId = treasure.riddleId || null;
-  let isMirroredCamera = false; // Track if camera is mirrored (front-facing)
-  
-  // Back button
+  let isMirroredCamera = false;
+
+  const captureModel = new CaptureEditModel();
+  captureModel.initFromTreasure(treasure);
+
   document.getElementById('btn-back').addEventListener('click', () => {
-    if (webcamStream) {
-      webcamStream.getTracks().forEach(track => track.stop());
-    }
+    store.cleanup();
     renderLevelEditScreen();
   });
-  
-  // Webcam controls
-  const video = document.getElementById('webcam-preview');
+
   const canvas = document.getElementById('capture-canvas');
-  const capturedImage = document.getElementById('captured-image');
-  const detectionOverlay = document.getElementById('detection-overlay');
   const btnStartWebcam = document.getElementById('btn-start-webcam');
   const btnCapture = document.getElementById('btn-capture');
   const btnCaptureDesktop = document.getElementById('btn-capture-desktop');
@@ -459,13 +450,11 @@ function setupEditorEvents(treasure, isNew) {
   const selectedObjectName = document.getElementById('selected-object-name');
   const featureLimitCheckbox = document.getElementById('feature-limit-checkbox');
 
-  let liveDetectionRunning = false;
-  let liveDetectionModel = null;
-  let lastLivePredictions = []; // Store last live detection results
-  let currentFacingMode = 'environment'; // 'environment' = rear, 'user' = front
-  let currentZoom = 1;
-  let zoomCapabilities = { min: 1, max: 1, step: 0 }; // Populated after camera starts
-  
+  const getStore = () => cameraDetectionStore.getState();
+  let currentFacingMode = getStore().facingMode;
+  let currentZoom = getStore().zoom;
+  let zoomCapabilities = getStore().zoomCapabilities;
+
   const btnSwitchCamera = document.getElementById('btn-switch-camera');
   const zoomLevel = document.getElementById('zoom-level');
   const webcamContainer = document.getElementById('webcam-container');
@@ -473,7 +462,26 @@ function setupEditorEvents(treasure, isNew) {
   const btnCameraClose = document.getElementById('btn-camera-close');
   const isMobile = /Android|iPhone|iPod|Windows Phone/i.test(navigator.userAgent);
 
-  const detectionOverlayView = new DetectionOverlayView(webcamContainer, detectionOverlay, { translateClass });
+  const mediaDetectionMount = document.getElementById('media-detection-mount');
+  const mediaDetectionView = new MediaDetectionView(mediaDetectionMount, cameraDetectionStore, { translateClass });
+
+  const captureView = new CaptureEditView(
+    {
+      store: cameraDetectionStore,
+      webcamContainer,
+      mediaDetectionView,
+      objectsList,
+      detectedObjectsSection,
+      selectedObjectName,
+      treasureNameInput: document.getElementById('treasure-name'),
+      btnCapture,
+      btnCapturedClose,
+      btnStartWebcam,
+      btnCaptureDesktop
+    },
+    { translateClass }
+  );
+  captureView.bindModel(captureModel);
   
   function openCameraModal() {
     if (isMobile) {
@@ -488,28 +496,25 @@ function setupEditorEvents(treasure, isNew) {
   }
   
   async function startCamera(facingMode) {
-    // Stop existing stream
-    if (webcamStream) {
-      webcamStream.getTracks().forEach(track => track.stop());
-    }
+    getStore().stopStream();
     stopLiveDetection();
     openCameraModal();
-    
+
     try {
-      webcamStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } } 
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } }
       });
-      video.srcObject = webcamStream;
+      getStore().setStream(stream);
       currentFacingMode = facingMode;
-      
-      const track = webcamStream.getVideoTracks()[0];
+      getStore().setFacingMode(facingMode);
+
+      const track = stream.getVideoTracks()[0];
       const settings = track.getSettings();
       const capabilities = track.getCapabilities ? track.getCapabilities() : {};
-      
+
       console.log('Camera settings:', settings);
       console.log('Camera capabilities:', capabilities);
-      
-      // Setup zoom capabilities
+
       if (capabilities.zoom) {
         zoomCapabilities = {
           min: capabilities.zoom.min || 1,
@@ -519,31 +524,27 @@ function setupEditorEvents(treasure, isNew) {
       } else {
         zoomCapabilities = { min: 1, max: 1, step: 0 };
       }
+      getStore().setZoomCapabilities(zoomCapabilities);
       currentZoom = settings.zoom || 1;
+      getStore().setZoom(currentZoom);
       zoomLevel.style.display = 'none';
       zoomLevel.textContent = `${currentZoom.toFixed(1)}x`;
-      
-      // Check if multiple cameras available for switch button
+
       const devices = await navigator.mediaDevices.enumerateDevices();
       const videoDevices = devices.filter(d => d.kind === 'videoinput');
       btnSwitchCamera.style.display = videoDevices.length > 1 ? 'flex' : 'none';
-      
-      // Show controls
+
       btnStartWebcam.style.display = 'none';
       if (!isMobile) {
         btnCaptureDesktop.style.display = 'inline-flex';
       }
-      
-      // Start live detection when video is ready (dimensions + 1 paint frame). Single async pipeline.
-      waitForVideoReady(video)
-        .then(() => loadObjectDetectionModel())
-        .then((model) => {
-          if (model) {
-            liveDetectionModel = model;
-            startLiveDetection();
-          }
-        })
-        .catch(() => {});
+
+      let model = getStore().detectionModel;
+      if (!model) model = await loadObjectDetectionModel();
+      if (model) {
+        getStore().setDetectionModel(model);
+        waitForVideoReady(mediaDetectionView.getVideo()).then(() => startLiveDetection()).catch(() => {});
+      }
     } catch (err) {
       alert('카메라 접근 권한이 필요합니다.');
       console.error('Webcam error:', err);
@@ -553,15 +554,16 @@ function setupEditorEvents(treasure, isNew) {
   let zoomBadgeTimeout = null;
   
   async function applyZoom(zoom) {
-    if (!webcamStream || zoomCapabilities.max <= 1) return;
-    const track = webcamStream.getVideoTracks()[0];
+    const stream = getStore().stream;
+    if (!stream || zoomCapabilities.max <= 1) return;
+    const track = stream.getVideoTracks()[0];
     const clamped = Math.max(zoomCapabilities.min, Math.min(zoomCapabilities.max, zoom));
     try {
       await track.applyConstraints({ advanced: [{ zoom: clamped }] });
       currentZoom = clamped;
+      getStore().setZoom(clamped);
       zoomLevel.textContent = `${clamped.toFixed(1)}x`;
       zoomLevel.style.display = 'inline-block';
-      // Auto-hide after 1.5s
       clearTimeout(zoomBadgeTimeout);
       zoomBadgeTimeout = setTimeout(() => { zoomLevel.style.display = 'none'; }, 1500);
     } catch (err) {
@@ -574,10 +576,7 @@ function setupEditorEvents(treasure, isNew) {
   btnCameraClose.addEventListener('click', () => {
     stopLiveDetection();
     closeCameraModal();
-    if (webcamStream) {
-      webcamStream.getTracks().forEach(track => track.stop());
-      webcamStream = null;
-    }
+    getStore().cleanup();
     switchToLiveView();
     btnStartWebcam.style.display = '';
     btnCaptureDesktop.style.display = 'none';
@@ -617,51 +616,49 @@ function setupEditorEvents(treasure, isNew) {
   
   // Mouse wheel zoom (desktop fallback)
   webcamContainer.addEventListener('wheel', (e) => {
-    if (!webcamStream || zoomCapabilities.max <= 1) return;
+    if (!getStore().stream || zoomCapabilities.max <= 1) return;
     e.preventDefault();
     const delta = e.deltaY > 0 ? -0.2 : 0.2;
     applyZoom(currentZoom + delta);
   }, { passive: false });
-  
-  // Live detection loop
+
   function startLiveDetection() {
-    liveDetectionRunning = true;
-    
+    getStore().setDetectionRunning(true);
+    const video = mediaDetectionView.getVideo();
+
     async function detectFrame() {
-      if (!liveDetectionRunning || !liveDetectionModel || video.paused || video.ended) {
-        return;
-      }
-      
-      // Wait for video to have dimensions and at least one frame (fixes first run no detection)
+      const st = getStore();
+      if (!st.detectionRunning || !st.detectionModel || video.paused || video.ended) return;
       if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
         requestAnimationFrame(detectFrame);
         return;
       }
-      
       try {
-        const predictions = await runDetection(liveDetectionModel, video, { scoreThreshold: 0.5 });
-        lastLivePredictions = predictions;
+        const predictions = await runDetection(st.detectionModel, video, { scoreThreshold: 0.5 });
+        getStore().setPredictions(predictions);
         let segmentMasks = [];
         if (isSegmentAvailableForClass('person')) {
           try {
             segmentMasks = await getSegmentMasks(video);
           } catch (_) {}
         }
-        drawLiveDetections(predictions, segmentMasks);
+        getStore().setSegmentMasks(segmentMasks);
+        getStore().setSourceSize(video.videoWidth, video.videoHeight);
+        if (webcamContainer && getStore().stream) {
+          webcamContainer.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+        }
+        updateRoomInfo(predictions);
       } catch (err) {
         console.error('Live detection error:', err);
       }
-      
-      // Continue loop (throttle to ~10fps for performance)
       setTimeout(() => requestAnimationFrame(detectFrame), 100);
     }
-    
     detectFrame();
   }
-  
+
   function stopLiveDetection() {
-    liveDetectionRunning = false;
-    detectionOverlayView.clear();
+    getStore().stopDetection();
+    mediaDetectionView.clearOverlay();
     document.getElementById('room-info-overlay').style.display = 'none';
   }
 
@@ -670,20 +667,6 @@ function setupEditorEvents(treasure, isNew) {
   const roomName = document.getElementById('room-name');
   const roomObjects = document.getElementById('room-objects');
 
-  function drawLiveDetections(predictions, segmentMasks = []) {
-    const videoWidth = video.videoWidth;
-    const videoHeight = video.videoHeight;
-    if (!videoWidth || !videoHeight) {
-      updateRoomInfo(predictions);
-      return;
-    }
-    detectionOverlayView.setSourceSize(videoWidth, videoHeight);
-    detectionOverlayView.setContent(predictions, segmentMasks, {
-      scoreThreshold: 0.5,
-      withIndex: false
-    });
-    updateRoomInfo(predictions);
-  }
   
   function updateRoomInfo(predictions) {
     const room = inferRoom(predictions);
@@ -716,273 +699,118 @@ function setupEditorEvents(treasure, isNew) {
   }
   
   async function performCapture() {
-    // Stop live detection first
     stopLiveDetection();
-    
-    // Store video dimensions before stopping
+    const video = mediaDetectionView.getVideo();
     const videoWidth = video.videoWidth;
     const videoHeight = video.videoHeight;
-    
-    // Capture image
-    captureWidth = videoWidth;
-    captureHeight = videoHeight;
+
     canvas.width = videoWidth;
     canvas.height = videoHeight;
     canvas.getContext('2d').drawImage(video, 0, 0);
-    capturedImageData = canvas.toDataURL('image/jpeg', 0.8);
-    capturedImage.src = capturedImageData;
-    video.style.display = 'none';
-    capturedImage.style.display = 'block';
-    if (btnCapture) btnCapture.style.display = 'none';
-    if (btnCapturedClose) btnCapturedClose.style.display = 'block';
-    btnCaptureDesktop.style.display = 'none';
+    const imageData = canvas.toDataURL('image/jpeg', 0.8);
 
-    // Stop webcam
-    if (webcamStream) {
-      webcamStream.getTracks().forEach(track => track.stop());
-    }
-    
-    // Use live detection results directly (no re-detection needed)
-    detectedObjects = lastLivePredictions;
-    
-    if (detectedObjects.length === 0) {
-      objectsList.innerHTML = '<p class="no-objects">검출된 오브젝트가 없습니다. 다시 촬영해보세요.</p>';
-      detectedObjectsSection.style.display = 'block';
+    getStore().stopStream();
+    const preds = getStore().predictions;
+
+    if (preds.length === 0) {
+      getStore().setStillImage(imageData, videoWidth, videoHeight);
+      getStore().setPredictions([]);
+      getStore().setSegmentMasks([]);
+      captureModel.setFromCapture(imageData, videoWidth, videoHeight, [], []);
+      captureView.showCapturedView();
       return;
     }
-    
-    // Wait for image to load
-    await new Promise(resolve => {
-      if (capturedImage.complete) resolve();
-      else capturedImage.onload = resolve;
-    });
-    // Wait for displayed dimensions (layout after display:block) so bbox drawing works first time
+
+    getStore().setStillImage(imageData, videoWidth, videoHeight);
+    getStore().setPredictions(preds);
+    const img = mediaDetectionView.getImage();
+    img.src = imageData;
     await new Promise((resolve) => {
-      let frames = 0;
-      const maxFrames = 60;
-      function check() {
-        if (capturedImage.clientWidth > 0 && capturedImage.clientHeight > 0) {
-          resolve();
-          return;
-        }
-        if (++frames >= maxFrames) {
-          resolve();
-          return;
-        }
-        requestAnimationFrame(check);
-      }
-      requestAnimationFrame(check);
+      if (img.complete) resolve();
+      else img.onload = resolve;
     });
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    let segmentMasks = [];
     if (isSegmentAvailableForClass('person')) {
       try {
-        lastSegmentMasksForCaptured = await getSegmentMasks(capturedImage);
-      } catch (_) {
-        lastSegmentMasksForCaptured = [];
-      }
-    } else {
-      lastSegmentMasksForCaptured = [];
+        segmentMasks = await getSegmentMasks(img);
+      } catch (_) {}
     }
-    drawCapturedDetections(detectedObjects, videoWidth, videoHeight, lastSegmentMasksForCaptured);
-    // Show detected objects list
-    renderDetectedObjects(detectedObjects);
-    detectedObjectsSection.style.display = 'block';
+    getStore().setSegmentMasks(segmentMasks);
+    captureModel.setFromCapture(imageData, videoWidth, videoHeight, preds, segmentMasks);
+    captureView.showCapturedView();
   }
-  
+
   btnCapture.addEventListener('click', performCapture);
   btnCaptureDesktop.addEventListener('click', performCapture);
 
-  function getStyleForPred(pred) {
-    const isSelected = selectedObject === pred.class;
-    return {
-      fillStyle: isSelected ? 'rgba(16, 185, 129, 0.25)' : 'rgba(99, 102, 241, 0.2)',
-      strokeStyle: isSelected ? '#10b981' : '#6366f1',
-      lineWidth: isSelected ? 4 : 3
-    };
-  }
-
-  function drawCapturedDetections(predictions, originalWidth, originalHeight, segmentMasks = []) {
-    detectionOverlayView.setSourceSize(originalWidth, originalHeight);
-    detectionOverlayView.setContent(predictions, segmentMasks, {
-      scoreThreshold: 0,
-      getStyle: getStyleForPred
-    });
-  }
-  
   async function detectObjects(imageElement) {
     showLoadingOverlay('AI 오브젝트 검출 중...');
-    
-    const model = await loadObjectDetectionModel();
+    let model = getStore().detectionModel;
+    if (!model) model = await loadObjectDetectionModel();
+    if (model) getStore().setDetectionModel(model);
     if (!model) {
       hideLoadingOverlay();
       alert('AI 모델 로딩에 실패했습니다.');
       return;
     }
-    
     try {
-      // Wait for image to load
-      await new Promise(resolve => {
+      await new Promise((resolve) => {
         if (imageElement.complete) resolve();
         else imageElement.onload = resolve;
       });
-      
       const predictions = await runDetection(model, imageElement, { scoreThreshold: 0.3 });
       hideLoadingOverlay();
-      detectedObjects = predictions;
-      
-      if (detectedObjects.length === 0) {
-        objectsList.innerHTML = '<p class="no-objects">검출된 오브젝트가 없습니다. 다시 촬영해보세요.</p>';
-        detectedObjectsSection.style.display = 'block';
-        return;
-      }
-      
-      // Wait for layout to be calculated after display change
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      if (isSegmentAvailableForClass('person')) {
+      const nw = imageElement.naturalWidth;
+      const nh = imageElement.naturalHeight;
+      const refCanvas = document.createElement('canvas');
+      refCanvas.width = nw;
+      refCanvas.height = nh;
+      refCanvas.getContext('2d').drawImage(imageElement, 0, 0);
+      const imageData = refCanvas.toDataURL('image/jpeg', 0.8);
+
+      let segmentMasks = [];
+      if (predictions.length > 0 && isSegmentAvailableForClass('person')) {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
         try {
-          lastSegmentMasksForCaptured = await getSegmentMasks(imageElement);
-        } catch (_) {
-          lastSegmentMasksForCaptured = [];
-        }
-      } else {
-        lastSegmentMasksForCaptured = [];
+          segmentMasks = await getSegmentMasks(imageElement);
+        } catch (_) {}
       }
-      drawDetections(detectionOverlay, detectedObjects);
-      
-      // Show detected objects list
-      renderDetectedObjects(detectedObjects);
-      detectedObjectsSection.style.display = 'block';
-      
+      getStore().setStillImage(imageData, nw, nh);
+      getStore().setPredictions(predictions);
+      getStore().setSegmentMasks(segmentMasks);
+      captureModel.setFromCapture(imageData, nw, nh, predictions, segmentMasks);
+      captureView.showCapturedView();
     } catch (err) {
       hideLoadingOverlay();
       console.error('Object detection error:', err);
       alert('오브젝트 검출 중 오류가 발생했습니다.');
     }
   }
-  
-  function drawDetections(_canvas, predictions) {
-    const nw = capturedImage.naturalWidth;
-    const nh = capturedImage.naturalHeight;
-    if (!nw || !nh) return;
-    detectionOverlayView.setSourceSize(nw, nh);
-    detectionOverlayView.setContent(predictions, lastSegmentMasksForCaptured || [], {
-      scoreThreshold: 0,
-      getStyle: (pred) => ({ ...getStyleForPred(pred), lineWidth: selectedObject === pred.class ? 4 : 2 })
-    });
-  }
-  
-  function renderDetectedObjects(predictions) {
-    objectsList.innerHTML = predictions.map((pred, index) => `
-      <button class="object-card ${selectedObject === pred.class ? 'selected' : ''}" 
-              data-class="${pred.class}" data-index="${index}">
-        <span class="object-number">${index + 1}</span>
-        <span class="object-name">${translateClass(pred.class)}</span>
-        <span class="object-score">${Math.round(pred.score * 100)}%</span>
-      </button>
-    `).join('');
-    
-    // Add click handlers
-    objectsList.querySelectorAll('.object-card').forEach(card => {
-      card.addEventListener('click', () => {
-        const objectClass = card.dataset.class;
-        const index = card.dataset.index != null ? parseInt(card.dataset.index, 10) : null;
-        selectObject(objectClass, index);
-      });
-    });
-  }
-  
-  function selectObject(objectClass, index) {
-    selectedObject = objectClass;
-    selectedDetectionIndex = index;
-    
-    objectsList.querySelectorAll('.object-card').forEach(card => {
-      const match = card.dataset.class === objectClass && parseInt(card.dataset.index, 10) === index;
-      card.classList.toggle('selected', match);
-    });
-    
-    if (selectedObjectName) selectedObjectName.textContent = ` · 선택: ${translateClass(objectClass)}`;
-    
-    drawDetections(detectionOverlay, detectedObjects);
-    
-    const nameInput = document.getElementById('treasure-name');
-    if (nameInput) nameInput.value = translateClass(objectClass);
-  }
-  
+
   function switchToLiveView() {
-    if (video) video.style.display = '';
-    if (capturedImage) capturedImage.style.display = 'none';
-    if (btnCapture) btnCapture.style.display = '';
-    if (btnCapturedClose) btnCapturedClose.style.display = 'none';
-    btnCaptureDesktop.style.display = 'inline-flex';
+    captureView.showLiveView();
   }
 
   async function handleRetake() {
-    capturedImageData = null;
-    selectedObject = null;
-    selectedDetectionIndex = null;
-    captureWidth = 0;
-    captureHeight = 0;
-    detectedObjects = [];
-    lastLivePredictions = [];
-    switchToLiveView();
-    detectedObjectsSection.style.display = 'none';
-    if (selectedObjectName) selectedObjectName.textContent = '';
+    captureModel.clear();
+    captureView.showLiveView();
+    captureView.setCapturedImageSrc('');
     await startCamera(currentFacingMode);
   }
 
   btnCapturedClose?.addEventListener('click', handleRetake);
 
-  /** 보물 수정 시: 저장된 캡처 이미지와 선택 오브젝트를 표시 */
-  async function restoreExistingCapture() {
-    if (!capturedImageData) return;
-    video.style.display = 'none';
-    capturedImage.style.display = 'block';
-    capturedImage.src = capturedImageData;
-    if (btnCapture) btnCapture.style.display = 'none';
-    if (btnCapturedClose) btnCapturedClose.style.display = 'block';
-    btnStartWebcam.style.display = 'none';
-    btnCaptureDesktop.style.display = 'none';
-
-    await new Promise((resolve) => {
-      if (capturedImage.complete) resolve();
-      else capturedImage.onload = resolve;
-    });
-    captureWidth = capturedImage.naturalWidth;
-    captureHeight = capturedImage.naturalHeight;
-
-    const model = await loadObjectDetectionModel();
-    if (!model) return;
-    const predictions = await runDetection(model, capturedImage, { scoreThreshold: 0.3 });
-    detectedObjects = predictions;
-    if (detectedObjects.length === 0) return;
-
-    if (selectedObject) {
-      const idx = detectedObjects.findIndex((p) => p.class === selectedObject);
-      if (idx >= 0) selectedDetectionIndex = idx;
-    }
-    if (isSegmentAvailableForClass('person')) {
-      try {
-        lastSegmentMasksForCaptured = await getSegmentMasks(capturedImage);
-      } catch (_) {
-        lastSegmentMasksForCaptured = [];
-      }
+  /** 수정 모드 초기값은 무조건 저장된 값만 사용. 재검출은 하지 않음. */
+  function applyInitialCaptureState() {
+    if (captureModel.hasImage()) {
+      captureView.update();
+      captureView.showCapturedView();
     } else {
-      lastSegmentMasksForCaptured = [];
-    }
-
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    detectionOverlayView.setSourceSize(captureWidth, captureHeight);
-    detectionOverlayView.setContent(detectedObjects, lastSegmentMasksForCaptured, {
-      scoreThreshold: 0,
-      getStyle: getStyleForPred
-    });
-    detectedObjectsSection.style.display = 'block';
-    renderDetectedObjects(detectedObjects);
-    if (selectedObjectName && selectedObject) {
-      selectedObjectName.textContent = ` · 선택: ${translateClass(selectedObject)}`;
+      captureView.showLiveView();
     }
   }
-  restoreExistingCapture().catch(() => {});
+  applyInitialCaptureState();
 
   // Riddle mode toggle
   const riddleMode = document.getElementById('riddle-mode');
@@ -1098,38 +926,45 @@ function setupEditorEvents(treasure, isNew) {
 
     const featureLimitEnabled = document.getElementById('feature-limit-checkbox')?.checked ?? true;
 
+    const payload = captureModel.getCapturePayload();
     const newTreasure = {
       id: treasure.id || `treasure-${Date.now()}`,
       order: currentTreasureIndex + 1,
       name: name,
       marker: { type: 'pattern', patternUrl: `/markers/marker-${currentTreasureIndex}.patt` },
-      capturedImage: capturedImageData,
-      detectedObject: selectedObject,
+      capturedImage: payload.capturedImage,
+      detectedObject: payload.detectedObject,
+      sourceWidth: payload.sourceWidth,
+      sourceHeight: payload.sourceHeight,
+      predictions: payload.predictions,
       riddle: riddle,
       riddleId: riddleId,
       hint: hint
     };
 
     if (featureLimitEnabled) {
-      if (selectedDetectionIndex != null && detectedObjects[selectedDetectionIndex] && capturedImageData) {
+      const selIdx = captureModel.selectedIndex;
+      const preds = captureModel.predictions;
+      if (selIdx != null && preds[selIdx] && payload.capturedImage) {
         try {
-          if (!capturedImage.complete) {
-            await new Promise(resolve => {
-              capturedImage.onload = resolve;
-              capturedImage.onerror = resolve;
+          const img = mediaDetectionView.getImage();
+          if (!img.complete) {
+            await new Promise((resolve) => {
+              img.onload = resolve;
+              img.onerror = resolve;
             });
           }
-          const w = captureWidth || capturedImage.naturalWidth;
-          const h = captureHeight || capturedImage.naturalHeight;
+          const w = captureModel.sourceWidth || img.naturalWidth;
+          const h = captureModel.sourceHeight || img.naturalHeight;
           if (w && h) {
             const refCanvas = document.createElement('canvas');
             refCanvas.width = w;
             refCanvas.height = h;
             const refCtx = refCanvas.getContext('2d');
-            refCtx.drawImage(capturedImage, 0, 0);
+            refCtx.drawImage(img, 0, 0);
             newTreasure.featureEmbedding = await getEmbeddingFromCrop(
               refCanvas,
-              detectedObjects[selectedDetectionIndex].bbox,
+              preds[selIdx].bbox,
               w,
               h
             );
@@ -1155,9 +990,7 @@ function setupEditorEvents(treasure, isNew) {
     }
     saveTreasures(treasures);
 
-    if (webcamStream) {
-      webcamStream.getTracks().forEach(track => track.stop());
-    }
+    getStore().cleanup();
     renderLevelEditScreen();
   });
 }
@@ -1688,18 +1521,27 @@ function addSetupStyles() {
     .captured-view-close:hover {
       background: rgba(0, 0, 0, 0.7);
     }
-    .webcam-container .preview-source {
+    .media-detection-view-container {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+    .media-detection-view {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+    .media-detection-view .preview-source,
+    .media-detection-view .detection-overlay {
       position: absolute;
       inset: 0;
       width: 100%;
       height: 100%;
       object-fit: contain;
     }
-    .webcam-container .detection-overlay {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
+    .media-detection-view .detection-overlay {
       pointer-events: none;
     }
     

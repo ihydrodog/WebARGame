@@ -171,6 +171,7 @@ function matchPredictionsToSegmentMasks(predictions, segmentMasks) {
   return map;
 }
 
+/** bbox 좌표(소스 픽셀)를 이미지 표시 크기(displayWidth×displayHeight)에 맞춰 스케일링하여 그림. */
 function drawPredictionsWithSegments(ctx, predictions, segmentMasks, opts = {}) {
   const sourceWidth = opts.sourceWidth || 1;
   const sourceHeight = opts.sourceHeight || 1;
@@ -195,10 +196,12 @@ function drawPredictionsWithSegments(ctx, predictions, segmentMasks, opts = {}) 
     const fillStyle = style?.fillStyle ?? 'rgba(99, 102, 241, 0.35)';
     const strokeStyle = style?.strokeStyle ?? '#6366f1';
 
-    if (hasSegment) {
-      const { mask, bbox } = segmentMasks[segmentIdx];
-      drawSegmentMask(ctx, mask, sourceWidth, sourceHeight, displayWidth, displayHeight, bbox, fillStyle, strokeStyle);
-    } else {
+    // 세그멘테이션 뷰 주석 처리
+    // if (hasSegment) {
+    //   const { mask, bbox } = segmentMasks[segmentIdx];
+    //   drawSegmentMask(ctx, mask, sourceWidth, sourceHeight, displayWidth, displayHeight, bbox, fillStyle, strokeStyle);
+    // } else {
+    {
       const [x, y, width, height] = pred.bbox;
       ctx.strokeStyle = strokeStyle;
       ctx.lineWidth = style?.lineWidth ?? 3;
@@ -223,6 +226,7 @@ function drawPredictionsWithSegments(ctx, predictions, segmentMasks, opts = {}) 
   });
 }
 
+/** 컨테이너 안에 소스 비율을 유지하며 맞춘 영역(이미지 표시 크기). bbox 좌표는 이 크기로 스케일링함. */
 export function getContainDisplayRect(clientW, clientH, sourceW, sourceH) {
   if (!sourceW || !sourceH) return { displayWidth: clientW, displayHeight: clientH, offsetX: 0, offsetY: 0 };
   const scale = Math.min(clientW / sourceW, clientH / sourceH);
@@ -268,14 +272,14 @@ export class DetectionOverlayView {
   setSourceSize(width, height) {
     this.sourceWidth = width;
     this.sourceHeight = height;
-    this.render();
+    requestAnimationFrame(() => this.render());
   }
 
   setContent(predictions, segmentMasks, drawOpts = {}) {
     this.predictions = predictions || [];
     this.segmentMasks = segmentMasks || [];
     this.drawOpts = drawOpts;
-    this.render();
+    requestAnimationFrame(() => this.render());
   }
 
   render() {

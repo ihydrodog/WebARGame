@@ -148,4 +148,20 @@ function startPlay(gameContainer, backToHome) {
 }
 
 // Start app when DOM is ready
-document.addEventListener('DOMContentLoaded', initApp);
+document.addEventListener('DOMContentLoaded', () => {
+  try {
+    initApp();
+  } catch (err) {
+    console.error('App init error:', err);
+    const app = document.getElementById('app');
+    if (app) {
+      app.innerHTML = `
+        <div class="home-screen" style="padding: 2rem; text-align: center;">
+          <h1>오류가 발생했습니다</h1>
+          <p style="color: #c00; margin: 1rem 0; font-family: monospace; word-break: break-all;">${String(err?.message || err)}</p>
+          <button class="btn btn-primary" onclick="location.reload()">새로고침</button>
+        </div>
+      `;
+    }
+  }
+});

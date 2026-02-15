@@ -14,6 +14,7 @@ import {
 import { loadDetectionModel, runDetection, isDetectionAvailable, pickDetectionAt } from './utils/detection.js';
 import { isSegmentAvailableForClass, getSegmentMasks } from './utils/segment-helper.js';
 import { DetectionOverlayView } from './utils/viewers.js';
+import { cameraDetectionStore } from './stores/camera-detection.js';
 
 let container = null;
 let onBack = null;
@@ -23,8 +24,6 @@ let score = 0;
 let scoreTimer = null;
 let isGameActive = false;
 
-let arStream = null;
-let arDetectionRunning = false;
 let arOverlayView = null;
 
 /**
@@ -201,10 +200,7 @@ function stopARMode() {
     arOverlayView.destroy();
     arOverlayView = null;
   }
-  if (arStream) {
-    arStream.getTracks().forEach(track => track.stop());
-    arStream = null;
-  }
+  cameraDetectionStore.getState().cleanup();
 }
 
 /**
@@ -244,10 +240,11 @@ function startARMode() {
     translateClass: getCocoLabel
   });
 
-  arDetectionRunning = true;
-  let arModel = null;
+  const store = cameraDetectionStore.getState();
+  store.setDetectionRunning(true);
   (async function detectionLoop() {
-    if (!arDetectionRunning || !video || !arOverlayView) return;
+    const st = cameraDetectionStore.getState();
+    if (!st.detectionRunning || !video || !arOverlayView) return;
     if (!isDetectionAvailable()) {
       setTimeout(detectionLoop, 200);
       return;
@@ -259,8 +256,12 @@ function startARMode() {
       }
       const vw = video.videoWidth;
       const vh = video.videoHeight;
-      if (!arModel) arModel = await loadDetectionModel();
-      const predictions = await runDetection(arModel, video, { scoreThreshold: 0.5 });
+      let model = st.detectionModel;
+      if (!model) {
+        model = await loadDetectionModel();
+        if (model) cameraDetectionStore.getState().setDetectionModel(model);
+      }
+      const predictions = await runDetection(model, video, { scoreThreshold: 0.5 });
       let segmentMasks = [];
       if (isSegmentAvailableForClass('person')) {
         try {
@@ -327,7 +328,7 @@ function startARMode() {
   navigator.mediaDevices.getUserMedia({
     video: { facingMode: 'environment' }
   }).then(stream => {
-    arStream = stream;
+    cameraDetectionStore.getState().setStream(stream);
     video.srcObject = stream;
   }).catch(err => {
     console.error('Camera error:', err);
@@ -360,11 +361,19 @@ async function tryFindTreasure(video, clickEvent) {
   }
 
   showToast('검출 중...', '');
-  let model;
+  const store = cameraDetectionStore.getState();
+  let model = store.detectionModel;
   try {
-    model = await loadDetectionModel();
+    if (!model) {
+      model = await loadDetectionModel();
+      if (model) store.setDetectionModel(model);
+    }
   } catch (err) {
     console.warn('COCO-SSD load failed:', err);
+    showToast('오브젝트 선택을 불러올 수 없어요.', 'error');
+    return;
+  }
+  if (!model) {
     showToast('오브젝트 선택을 불러올 수 없어요.', 'error');
     return;
   }
